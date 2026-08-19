@@ -75,6 +75,10 @@ Spend-so-far is shown after every tool result. The session force-ends at
 the cap. Be decisive: read what matters, change what matters, verify,
 done.
 
+# League notices (read first — engine updates, rule changes)
+
+${league_notices}
+
 # Tonight
 
 ${night_brief}

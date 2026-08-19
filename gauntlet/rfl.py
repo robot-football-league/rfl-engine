@@ -59,15 +59,26 @@ def load_team(path: str | Path) -> Team:
     spec.loader.exec_module(module)
     if not hasattr(module, "build_team"):
         raise ValueError(f"{path}/team.py must define build_team(ctx)")
-    color = cfg.get("color", [0.5, 0.5, 0.5])
+    home = cfg.get("kit_home") or {}
+    away = cfg.get("kit_away") or {}
+    color = home.get("color") or cfg.get("color", [0.5, 0.5, 0.5])
     if len(color) == 3:
         color = [*color, 1.0]
-    return Team(path=path, name=cfg["name"], code=cfg.get("code", cfg["name"][:3].upper()),
+    team_kit_away = None
+    if away.get("color"):
+        ac = list(away["color"])
+        if len(ac) == 3:
+            ac = [*ac, 1.0]
+        team_kit_away = (tuple(float(v) for v in ac),
+                         away.get("color_name", "away colors"))
+    t = Team(path=path, name=cfg["name"], code=cfg.get("code", cfg["name"][:3].upper()),
                 color=tuple(float(v) for v in color),
-                color_name=cfg.get("color_name", "colored"),
+                color_name=home.get("color_name") or cfg.get("color_name", "colored"),
                 hair=cfg.get("hair") or {},
                 players=cfg.get("players") or [],
                 module=module)
+    t.kit_away = team_kit_away          # (rgba, name) or None
+    return t
 
 
 def run_rfl_match(team_a_dir, team_b_dir, match_time_s: float = 90.0,
@@ -75,6 +86,12 @@ def run_rfl_match(team_a_dir, team_b_dir, match_time_s: float = 90.0,
                   video_path=None, log_dir=None):
     from .football import run_match
     a, b = load_team(team_a_dir), load_team(team_b_dir)
+    clash = sum((x - y) ** 2 for x, y in
+                zip(a.color[:3], b.color[:3])) < 0.18
+    if clash and getattr(b, "kit_away", None):
+        b.color, b.color_name = b.kit_away
+        print(f"  [kits] color clash: {b.name} wear their away kit "
+              f"({b.color_name})")
     print(f"RFL MATCH DAY: {a.name} ({a.code}) vs {b.name} ({b.code})")
     squads = []
     for tm, team in enumerate((a, b)):

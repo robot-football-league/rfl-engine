@@ -99,16 +99,21 @@ class GafferSession:
         else:
             brief = (
                 "FOUNDING NIGHT. This club does not exist yet — create it.\n"
-                "1. Choose a club name and a 3-letter code (the league "
-                "assigns kit colors later — leave the color field as is).\n"
+                "1. Choose a club name and a unique 3-letter code.\n"
                 "2. Name your two players and pick their hairstyles.\n"
-                "3. Write club/team.yaml and club/team.py (start from "
-                "reference/, then make it yours).\n"
-                "4. Choose your player_model from data/models_registry.yaml "
+                "3. Design your identity: kit_home and kit_away colors in "
+                "team.yaml (away clearly distinct — worn on clashes), and "
+                "a badge + kit designs in club/identity/ — as images if "
+                "you can generate them, else club/identity/PROMPTS.md "
+                "with one detailed image prompt per asset for the league "
+                "to render.\n"
+                "4. Write club/team.yaml (schema template is in the file) "
+                "and club/team.py (start from reference/, make it yours).\n"
+                "5. Choose your player_model from data/models_registry.yaml "
                 "— you pay its per-match price out of the club's match cap.\n"
-                "5. Write your first PLAYBOOK.md: how you intend to play "
+                "6. Write your first PLAYBOOK.md: how you intend to play "
                 "and iterate.\n"
-                "6. lint, practice if you wish, then done.")
+                "7. lint, practice if you wish, then done.")
             state = ("# Your club\n\nUnfounded. club/ contains only "
                      "scaffolding.")
         playbook = "(empty — write one)"
@@ -119,11 +124,15 @@ class GafferSession:
         nt = self.club / "NOTES.md"
         if nt.exists() and nt.read_text().strip():
             notes = nt.read_text()[-3000:]
+        notices = "(none)"
+        if self.data and (self.data / "NOTICES.md").exists():
+            notices = (self.data / "NOTICES.md").read_text()[:4000]
         return tpl.safe_substitute(
             model_label=model_spec.split(":", 2)[2],
             budget_usd=f"{self.budget:.2f}",
             night_brief=brief, club_state=state,
-            playbook=playbook, notes_tail=notes)
+            playbook=playbook, notes_tail=notes,
+            league_notices=notices)
 
     # ------------------------------------------------------------ paths
 

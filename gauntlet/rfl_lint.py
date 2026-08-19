@@ -47,9 +47,11 @@ def check_team(team_dir) -> list[str]:
         return [f"team.yaml unparseable: {e}"]
     if not isinstance(cfg, dict):
         return ["team.yaml is empty (club not founded yet)"]
-    for key in ("name", "code", "color", "player_model"):
+    for key in ("name", "code", "player_model"):
         if not cfg.get(key):
             problems.append(f"team.yaml missing '{key}'")
+    if not (cfg.get("color") or (cfg.get("kit_home") or {}).get("color")):
+        problems.append("team.yaml needs kit_home.color (or legacy color)")
     if cfg.get("code") and len(str(cfg["code"])) != 3:
         problems.append("team.yaml 'code' must be exactly 3 letters")
 
