@@ -80,6 +80,7 @@ def play_next(league_path="league.yaml", audio=True):
         f"teams/{home}", f"teams/{away}",
         match_time_s=float(cfg.get("match_time_s", 600)),
         halves=int(cfg.get("halves", 2)),
+        record_states=True,   # every fixture becomes volumetric-exportable
         video_path=str(out / "match.mp4"), log_dir=str(out))
     entry = {"fixture": k + 1, "home": home, "away": away,
              "score": list(res.score),
@@ -99,6 +100,11 @@ def play_next(league_path="league.yaml", audio=True):
             add_match_audio(out)
         except Exception as e:  # a silent match still counts
             print(f"  [audio] skipped: {e}")
+    try:                        # volumetric replay bundle (after the audio
+        from .volumetric import export_match      # mix, so it can carry it)
+        export_match(out)
+    except Exception as e:      # a bundle-less match still counts
+        print(f"  [volumetric] export skipped: {e}")
     print_table(league_path)
     return entry
 

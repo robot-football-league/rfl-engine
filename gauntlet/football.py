@@ -380,6 +380,30 @@ def _add_hair(spec, prefix: str, style: str, color):
 HAIR_STYLES = ("none", "short", "long", "ponytail", "mohawk")
 
 
+# JERSEYS: like hair, purely cosmetic. The kit design (identity/kit_*.png,
+# square) is shown on thin chest and back panels welded to the torso —
+# zero mass, zero collision, pure render geometry. The torso meshes stay
+# tinted in the kit color underneath, which is also the whole fallback
+# when a club has no kit image.
+def _add_jersey(spec, prefix: str, mat_name: str):
+    body = spec.body(f"{prefix}pelvis")
+    for tag, x, quat in (
+            ("front", 0.148, [0.5, 0.5, 0.5, 0.5]),
+            ("back", -0.165, [0.5, 0.5, -0.5, -0.5])):
+        g = body.add_geom()
+        g.name = f"{prefix}jersey_{tag}"
+        g.type = mujoco.mjtGeom.mjGEOM_BOX
+        g.size = [0.095, 0.095, 0.004]   # width, height, thickness (half)
+        g.pos = [x, 0.0, 0.235]
+        g.quat = quat                    # +Z faces outward, image upright
+        g.material = mat_name
+        g.rgba = [1.0, 1.0, 1.0, 1.0]
+        g.mass = 0.0
+        g.contype = 0
+        g.conaffinity = 0
+        g.group = 1
+
+
 def _vivid(col):
     """Team color as TEXT on a dark panel: lighten dark kits so they read."""
     r, g, b = col[:3]
@@ -389,10 +413,24 @@ def _vivid(col):
 
 
 def build_football_model(manager_teams: tuple = (), cameras: bool = False,
-                         team_colors=TEAM_RGBA, hair=None) -> mujoco.MjModel:
+                         team_colors=TEAM_RGBA, hair=None,
+                         kit_textures=None) -> mujoco.MjModel:
     from . import paths
     from .scene import EGOCAM_POS, _egocam_quat
     spec = mujoco.MjSpec.from_string(_pitch_xml(team_colors))
+    kit_mats = {}
+    for tm, png in (kit_textures or {}).items():
+        if not png:
+            continue
+        tex = spec.add_texture()
+        tex.name = f"kit_tex{tm}"
+        tex.type = mujoco.mjtTexture.mjTEXTURE_2D
+        tex.file = str(png)
+        tex.content_type = "image/png"
+        mat = spec.add_material()
+        mat.name = f"kit_mat{tm}"
+        mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = tex.name
+        kit_mats[tm] = mat.name
     spots = list(KICKOFFS) + [MANAGER_SPAWNS[tm] for tm in sorted(manager_teams)]
     mgr_team_of = {N_ROBOTS + k: tm for k, tm in enumerate(sorted(manager_teams))}
     for i, (x, y, yaw) in enumerate(spots):
@@ -436,6 +474,8 @@ def build_football_model(manager_teams: tuple = (), cameras: bool = False,
             marker.contype = 0
             marker.conaffinity = 0
             marker.group = 1
+        if not is_mgr and team in kit_mats:
+            _add_jersey(spec, f"r{i}_", kit_mats[team])
         if hair and not is_mgr:
             h = hair.get(team) or {}
             if isinstance(h, list):   # per-player looks: [p0_look, p1_look]
@@ -544,6 +584,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
               player_names=None,   # {team: [name0, name1]}
               halves: int = 1,     # 2 = two halves of match_time_s/2 each
               record_states: bool | None = None,  # None = RFL_EXPORT_STATES env
+              kit_textures=None,   # {team: path-to-kit-png} for jersey panels
               video_path=None, log_dir=None) -> MatchResult:
     assert len(agents) == N_ROBOTS and mode in ("paused", "realtime")
     managers = managers or {}
@@ -551,7 +592,8 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
     n_bodies = N_ROBOTS + len(managers)
     model = build_football_model(manager_teams=tuple(managers),
                                  cameras=(obs_mode in ("camera", "sdk")),
-                                 team_colors=team_colors, hair=hair)
+                                 team_colors=team_colors, hair=hair,
+                                 kit_textures=kit_textures)
     ctrls = [G1PolicyController(prefix=f"r{i}_") for i in range(n_bodies)]
     model.opt.timestep = ctrls[0].simulation_dt
     data = mujoco.MjData(model)
@@ -671,7 +713,17 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
     if record_states and log_dir:
         log_dir.mkdir(parents=True, exist_ok=True)
         state_rec = {"t": [], "xpos": [], "xquat": [], "next_t": 0.0}
-        mujoco.mj_saveModel(model, str(log_dir / "scene.mjb"), None)
+        # everything the exporter needs to rebuild THIS model exactly;
+        # a full scene.mjb is ~380 MB/match (embedded meshes), so it is
+        # opt-in for debugging only
+        (log_dir / "scene_build.json").write_text(json.dumps({
+            "manager_teams": sorted(managers),
+            "cameras": obs_mode in ("camera", "sdk"),
+            "team_colors": [list(c) for c in team_colors],
+            "hair": hair,
+            "kit_textures": kit_textures or {}}))
+        if os.environ.get("RFL_EXPORT_MJB"):
+            mujoco.mj_saveModel(model, str(log_dir / "scene.mjb"), None)
     decisions_f = None
     telemetry_f = None
     comms_f = None

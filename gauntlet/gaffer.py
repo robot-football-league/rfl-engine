@@ -98,7 +98,11 @@ class GafferSession:
             state = "# Your club\n\n" + (self.club / "team.yaml").read_text()
         else:
             brief = (
-                "FOUNDING NIGHT. This club does not exist yet — create it.\n"
+                "FOUNDING NIGHT. This club does not exist yet — create it. "
+                "The club is YOU, the model: name it after yourself, declare "
+                "yourself in team.yaml (gaffer: model + maker), theme the "
+                "players the same way, and use your maker's recognizable "
+                "colors so spectators can tell models apart at a glance.\n"
                 "1. Choose a club name and a unique 3-letter code.\n"
                 "2. Name your two players and pick their hairstyles.\n"
                 "3. Design your identity: kit_home and kit_away colors in "

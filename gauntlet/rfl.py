@@ -83,15 +83,23 @@ def load_team(path: str | Path) -> Team:
 
 def run_rfl_match(team_a_dir, team_b_dir, match_time_s: float = 90.0,
                   mode: str = "realtime", halves: int = 1,
+                  record_states: bool | None = None,
                   video_path=None, log_dir=None):
     from .football import run_match
     a, b = load_team(team_a_dir), load_team(team_b_dir)
     clash = sum((x - y) ** 2 for x, y in
                 zip(a.color[:3], b.color[:3])) < 0.18
+    b_kit_png = "kit_home.png"
     if clash and getattr(b, "kit_away", None):
         b.color, b.color_name = b.kit_away
+        b_kit_png = "kit_away.png"
         print(f"  [kits] color clash: {b.name} wear their away kit "
               f"({b.color_name})")
+    kit_textures = {}
+    for tm, (team, png) in enumerate(((a, "kit_home.png"), (b, b_kit_png))):
+        f = team.path / "identity" / png
+        if f.exists():
+            kit_textures[tm] = str(f.resolve())
     print(f"RFL MATCH DAY: {a.name} ({a.code}) vs {b.name} ({b.code})")
     squads = []
     for tm, team in enumerate((a, b)):
@@ -112,6 +120,7 @@ def run_rfl_match(team_a_dir, team_b_dir, match_time_s: float = 90.0,
               1: ([pl.get("hair") or {} for pl in b.players] if b.players else b.hair)},
         player_names={0: [pl.get("name", "") for pl in a.players],
                       1: [pl.get("name", "") for pl in b.players]},
+        record_states=record_states, kit_textures=kit_textures,
         video_path=video_path, log_dir=log_dir)
     fixture = {"engine": ENGINE_VERSION,
                "home": {"team": a.name, "code": a.code, "goals": result.score[0]},
