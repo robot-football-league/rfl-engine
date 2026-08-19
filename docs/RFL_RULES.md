@@ -282,9 +282,14 @@ as the league's control group.
   comms.jsonl, telemetry.jsonl, tables, commentary). Each club
   additionally receives its OWN robots' decisions.jsonl privately.
 - Scrutineering (python -m gauntlet lint) mechanically enforces the
-  realism law on club code: an import allowlist, no engine internals,
-  no I/O in match code. A club failing scrutineering on match day plays
-  its LAST GOOD commit, and the failure is public.
+  realism law on club code: an import allowlist (stdlib basics, numpy,
+  torch, the engine's public factories), no engine internals, no I/O in
+  match code. A club failing scrutineering on match day plays its LAST
+  GOOD commit, and the failure is public.
+- Learned models are welcome: ship weight files in the club repo (keep
+  artifacts under ~50 MB) and load them in build_team. Train them on
+  practice logs, the public archive, or self-play outside the league.
+  The ~2 s decision budget is the only clock.
 - Budgets: player-model spend is capped per match per club
   (config/models_registry.yaml); gaffer sessions have a hard nightly
   budget. Overspend is logged publicly.

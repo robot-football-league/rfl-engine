@@ -18,8 +18,8 @@ ALLOWED_MODULES = {
     "math", "random", "json", "typing", "dataclasses", "collections",
     "itertools", "functools", "heapq", "statistics", "enum", "copy",
     "bisect", "array", "string", "re", "time",
-    # numerics + the public engine surface
-    "numpy", "gauntlet.football", "gauntlet.rfl_sdk",
+    # numerics, learned models + the public engine surface
+    "numpy", "torch", "gauntlet.football", "gauntlet.rfl_sdk",
 }
 FORBIDDEN_CALLS = {"eval", "exec", "compile", "__import__", "open",
                    "breakpoint", "input", "vars", "globals"}
