@@ -1,0 +1,15 @@
+# Mock United — the zero-dependency demo team bundled with the engine.
+# The mock provider does crude proportional steering with no API calls,
+# so `python -m gauntlet rfl examples/mock_united examples/mock_united ...`
+# runs anywhere. Copy the sample-team repo, not this, to build a real team.
+name: Mock United
+code: MCK
+color: [0.55, 0.55, 0.62]
+color_name: grey
+player_model: llm:mock:ok
+manager_model: null
+players:
+  - name: Placebo
+    hair: {style: short, color: [0.2, 0.2, 0.2]}
+  - name: Stubby
+    hair: {style: none}

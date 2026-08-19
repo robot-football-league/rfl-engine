@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rfl-engine"
+version = "0.3.0"
+description = "Robot Football League match engine: 2v2 Unitree G1 football in MuJoCo with LLM brains"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+dependencies = [
+    "mujoco>=3.1",
+    "numpy",
+    "pillow",
+    "pyyaml",
+    "torch",
+    "websockets",
+]
+
+[project.optional-dependencies]
+llm = ["anthropic", "openai", "google-genai"]
+
+[project.urls]
+Homepage = "https://github.com/robot-football-league/rfl-engine"
+League = "https://twitch.tv/rfl_robot_football_league"
+
+[tool.setuptools]
+packages = ["gauntlet"]
+
+[tool.setuptools.package-data]
+gauntlet = ["envelope.json"]
