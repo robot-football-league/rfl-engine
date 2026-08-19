@@ -216,9 +216,11 @@ class LLMAgent:
                         self._dropped_params.update(dropped)
                         continue  # retry immediately without the param
                     return None, None, msg  # other 400s won't fix themselves
-                if status in (401, 403, 404):
-                    # bad key or nonexistent model: neither fixes itself
-                    # mid-episode — fail every future tick instantly
+                if status in (401, 403, 404) or "api key" in str(e).lower():
+                    # bad/missing key or nonexistent model: neither fixes
+                    # itself mid-episode — fail every future tick instantly
+                    # (the genai SDK raises key errors as plain ValueError,
+                    # which otherwise masquerades as a hung call via backoff)
                     self._fatal = msg
                     return None, None, msg
                 last_err = msg  # rate limit / 5xx / network: back off
