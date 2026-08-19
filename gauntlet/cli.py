@@ -56,42 +56,6 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="gauntlet", description="G1 Gauntlet harness")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    m0 = sub.add_parser("m0", help="M0 gate: walk/turn/sidestep/mixed acceptance test")
-    m0.add_argument("--no-video", action="store_true")
-    m0.add_argument("--out", default=None)
-
-    sub.add_parser("envelope", help="M0 envelope sweep -> docs/ENVELOPE.md + envelope.json")
-
-    ep = sub.add_parser("episode", help="run one episode")
-    ep.add_argument("--agent", required=True, help="random | scripted | llm:<provider>:<model>")
-    ep.add_argument("--course", required=True, help="seed:<n> | hand_a | hand_b | hand_c")
-    ep.add_argument("--video", default=None, help="output MP4 path")
-    ep.add_argument("--log-dir", default=None)
-    ep.add_argument("--repeat", type=int, default=0)
-    ep.add_argument("--mode", choices=["paused", "realtime"], default="paused",
-                    help="paused: sim waits for decisions (oracle); "
-                         "realtime: wall-clock, latency counts")
-
-    co = sub.add_parser("courses", help="generate course JSONs (seeded batch + hand set)")
-    co.add_argument("--seeds", type=int, default=20)
-
-    ba = sub.add_parser("batch", help="run a full batch from a YAML config")
-    ba.add_argument("config", help="path to run.yaml")
-
-    dm = sub.add_parser("duel-m0", help="V2-M0 gate: two G1s track commands in one sim")
-    dm.add_argument("--no-video", action="store_true")
-
-    ra = sub.add_parser("race", help="one shared-arena race between two agents")
-    ra.add_argument("--agents", nargs=2, required=True, metavar=("A", "B"))
-    ra.add_argument("--course", required=True)
-    ra.add_argument("--swap", action="store_true", help="exchange lane assignment")
-    ra.add_argument("--video", default=None)
-    ra.add_argument("--log-dir", default=None)
-    ra.add_argument("--mode", choices=["paused", "realtime"], default="paused")
-
-    rb = sub.add_parser("race-batch", help="race protocol from a YAML config")
-    rb.add_argument("config")
-
     fb = sub.add_parser("football", help="V4: 2v2 football match")
     fb.add_argument("--team-a", default="scripted", help="agent spec for both A players")
     fb.add_argument("--team-b", default="scripted", help="agent spec for both B players")
@@ -150,9 +114,6 @@ def main(argv=None):
     cm.add_argument("--players-a", default=None, help="comma: name1,name2")
     cm.add_argument("--players-b", default=None, help="comma: name1,name2")
 
-    ce = sub.add_parser("contact", help="V2-M1: robot-robot collision experiment")
-    ce.add_argument("--no-videos", action="store_true")
-
     lt = sub.add_parser("lint", help="scrutineering: check a team dir against league law")
     lt.add_argument("team")
 
@@ -184,70 +145,6 @@ def main(argv=None):
         run_night(args.team, args.model, args.night, args.budget,
                   data_dir=args.data_dir, ref_dir=args.ref_dir)
         return
-
-    if args.cmd == "m0":
-        from .m0 import run_m0
-        res = run_m0(out_dir=args.out, video=not args.no_video)
-        raise SystemExit(0 if res["all_pass"] else 1)
-
-    if args.cmd == "envelope":
-        from .m0 import run_envelope
-        run_envelope()
-        return
-
-    if args.cmd == "episode":
-        from .agents import make_agent
-        from .episode import run_episode
-
-        course, cname = _load_course(args.course)
-        prompt = "takeshi_v1" if course.meta.get("format") == "takeshi" else None
-        agent = make_agent(args.agent, arena_half=course.arena_half,
-                           course=course, prompt=prompt)
-        res = run_episode(course, agent, repeat=args.repeat,
-                          video_path=args.video, log_dir=args.log_dir,
-                          course_name=cname, mode=args.mode)
-        print(json.dumps(res.to_dict(), indent=2))
-        return
-
-    if args.cmd == "courses":
-        from . import paths
-        from .course import generate_course, hand_courses
-
-        out = paths.COURSES
-        for name, spec in hand_courses().items():
-            spec.save(out / "hand" / f"{name}.json")
-            print(f"wrote courses/hand/{name}.json")
-        for seed in range(args.seeds):
-            spec = generate_course(seed)
-            spec.save(out / "generated" / f"seed_{seed:03d}.json")
-        print(f"wrote {args.seeds} generated courses -> courses/generated/")
-        return
-
-    if args.cmd == "batch":
-        from .batch import run_batch
-        run_batch(args.config)
-        return
-
-    if args.cmd == "duel-m0":
-        from .duel import run_duel_m0
-        res = run_duel_m0(video=not args.no_video)
-        raise SystemExit(0 if res["all_pass"] else 1)
-
-    if args.cmd == "race":
-        from .agents import make_agent
-        from .race import run_race
-        course, cname = _load_course(args.course)
-        prompt = "takeshi_v1" if course.meta.get("format") == "takeshi" else "race_v1"
-        agents = [make_agent(a, prompt=prompt, arena_half=course.arena_half)
-                  for a in args.agents]
-        res = run_race(course, agents, swap=args.swap, video_path=args.video,
-                       log_dir=args.log_dir, course_name=cname, mode=args.mode)
-        print(json.dumps(res.to_dict(), indent=2))
-        return
-
-    if args.cmd == "race-batch":
-        from .race_batch import run_race_batch
-        run_race_batch(args.config)
 
     if args.cmd == "football":
         import json as _json
@@ -336,12 +233,6 @@ def main(argv=None):
                     video_path=args.video, log_dir=args.out,
                     tokens=args.tokens.split(",") if args.tokens else None)
         return
-
-    if args.cmd == "contact":
-        from .duel import run_contact_experiment
-        run_contact_experiment(videos=not args.no_videos)
-        return
-
 
 if __name__ == "__main__":
     main()

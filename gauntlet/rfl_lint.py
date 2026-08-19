@@ -52,6 +52,12 @@ def check_team(team_dir) -> list[str]:
             problems.append(f"team.yaml missing '{key}'")
     if not (cfg.get("color") or (cfg.get("kit_home") or {}).get("color")):
         problems.append("team.yaml needs kit_home.color (or legacy color)")
+    styles = ("none", "short", "long", "ponytail", "mohawk")
+    for j, pl in enumerate(cfg.get("players") or []):
+        st = ((pl.get("hair") or {}).get("style"))
+        if st is not None and st not in styles:
+            problems.append(f"players[{j}].hair.style '{st}' unknown "
+                            f"(one of {'/'.join(styles)})")
     if cfg.get("code") and len(str(cfg["code"])) != 3:
         problems.append("team.yaml 'code' must be exactly 3 letters")
 

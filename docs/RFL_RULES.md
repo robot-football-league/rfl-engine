@@ -178,8 +178,10 @@ them individually. 3 points a win, 1 a draw.
 ## Team look (cosmetic only)
 
 `team.yaml` may set a team-wide `hair: {style: ..., color: [r,g,b]}`, or a
-per-player entry inside each `players:` roster item, with style one of
-none / short / long / ponytail / mohawk. Hairstyles are welded, massless,
+per-player entry inside each `players:` roster item, with style one of:
+`none` (bare head), `short` (cropped bob around the crown), `long`
+(falls past the shoulders), `ponytail` (gathered into a tail sweeping
+out the back), `mohawk` (a crest along the midline). Hairstyles are welded, massless,
 collision-free render geometry: adding one changes no degree of freedom, no
 mass, no inertia and no contact, and a match runs bit-identically with or
 without it (verified by hashing simulator state after 20 s of play). Purely

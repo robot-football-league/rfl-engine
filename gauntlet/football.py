@@ -80,7 +80,9 @@ PERCEPT_PERIOD_S = 0.4
 
 MATCH_TIME_S = 90.0
 KICKOFF_FREEZE_S = 0.5   # command blend-in after each reset
-HALF_BREAK_S = 6.0       # halftime pause (banner + robots reset to kickoff)
+HALF_BREAK_S = 12.0      # halftime pause (banner + robots reset to
+                         # kickoff): long enough to read as a real
+                         # interval — whistle, stillness, whistle
 # sound-event tape: ball impulse events sampled at 25 Hz for the broadcast
 # audio mix (gauntlet/broadcast_audio.py). Data capture only — no audio is
 # produced during the match.
@@ -1436,6 +1438,10 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
             blenders[i].set_target((0.0, 0.0, 0.0), t)
             if skills is not None:
                 skills[i].skill, skills[i].path = "hold", []
+        for j in range(N_ROBOTS):
+            bubbles[j] = ("", -1e9)   # a restart wipes the radio: chatter
+            teammate_msg[j] = ""      # from before it reads as nonsense
+                                      # floating over teleported players
         mujoco.mj_forward(model, data)
 
     def play_goal_replay(scorer, goal_t):

@@ -82,9 +82,14 @@ def play_next(league_path="league.yaml", audio=True):
         halves=int(cfg.get("halves", 2)),
         record_states=True,   # every fixture becomes volumetric-exportable
         video_path=str(out / "match.mp4"), log_dir=str(out))
+    def roster(td):
+        cfg_t = yaml.safe_load((Path("teams") / td / "team.yaml").read_text())
+        return [p.get("name", f"#{j + 1}")
+                for j, p in enumerate(cfg_t.get("players") or [])][:2]
     entry = {"fixture": k + 1, "home": home, "away": away,
              "score": list(res.score),
              "goals": res.goals, "est_cost_usd": res.est_cost_usd,
+             "players": {"home": roster(home), "away": roster(away)},
              "dir": str(out)}
     state["played"].append(entry)
     state_p.write_text(json.dumps(state, indent=2))
