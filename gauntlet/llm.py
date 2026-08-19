@@ -34,6 +34,7 @@ DROPPABLE_PARAMS = {
     "temperature": ("temperature",),
     "thinking": ("thinking",),
     "output_config": ("output_config", "effort"),
+    "reasoning_effort": ("reasoning_effort",),
 }
 
 
@@ -59,10 +60,12 @@ def _extract_json(text: str, required=frozenset(("vx", "vy", "wz"))):
 
 PRICES = [
     ("claude-fable-5", 10.0, 50.0),
-    # TODO(robin): confirm launch pricing for the season-2 gaffer models
-    ("gpt-5.6", 5.0, 20.0),          # placeholder until confirmed
+    ("gpt-5.6-sol", 5.0, 30.0),
+    ("gpt-5.6-terra", 2.0, 12.0),
+    ("gpt-5.6-luna", 0.20, 1.20),
+    ("gpt-5.4-mini", 0.75, 4.50),
+    ("gpt-5.4-nano", 0.20, 1.25),
     ("gemini-3.7-flash", 0.5, 3.0),  # placeholder until confirmed
-    ("glm-5.3", 1.0, 4.0),           # placeholder until confirmed
     ("claude-opus-5", 5.0, 25.0),
     ("claude-sonnet-5", 2.0, 10.0),
     ("claude-haiku-4-5", 1.0, 5.0),
@@ -300,6 +303,11 @@ class LLMAgent:
         )
         if "temperature" not in self._dropped_params:
             kwargs["temperature"] = 0.0
+        if "reasoning_effort" not in self._dropped_params:
+            # reasoning-tier models overrun the 3 s shot clock at their
+            # default effort (gpt-5.6-luna: 4.5 s default, 2.6 s at low);
+            # models that reject the param drop it via the 400-retry path
+            kwargs["reasoning_effort"] = getattr(self, "effort", None) or "low"
         resp = self._client.chat.completions.create(**kwargs)
         text = resp.choices[0].message.content or ""
         usage = None
