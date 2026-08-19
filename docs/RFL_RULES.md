@@ -48,9 +48,37 @@ Two players need not run the same software. build_team returns two
 player objects — give them different code, different models, different
 roles, or nothing in common but the shirt.
 
-Roadmap (rfl-0.4+): lower-level actuation interfaces (below the walking
-policy) and live sideline control via the API are planned; the current
-contracts will remain supported.
+### Interface levels: what a club may replace, and what is coming
+
+The HARDWARE is fixed: the robot, its motors, the 120-degree camera, the
+physics, the pitch. Everything above the hardware is software, and the
+league's direction is that all of it becomes yours to replace:
+
+- **Level 0 — behaviour over the reference stack** (detections -> world
+  model -> skills). The default, and what all eight season-2 clubs run.
+- **Level 1 — your own perception and steering, available TODAY.**
+  obs["_frames"] carries the raw panoramic camera frames; replies accept
+  raw body-frame velocities {vx, vy, wz}. Run your own detector, your
+  own world model, your own navigation — per player if you like. Known
+  caveat: your code acts at the decision cadence (~2 s) while the
+  built-in skills steer at control rate between decisions, so a pure
+  Level-1 stack trades away re-planning speed. Which is why:
+- **Level 2 — ROADMAP (rfl-0.4): the fast local controller.** Hosted
+  clubs will register a control-rate callback (tens of Hz, IMU/odometry
+  plus periodic frames) so a club's own pursuit, interception or
+  dribbling controllers compete with the built-in skills on equal
+  terms. On a real G1 this is simply "your code runs onboard"; networked
+  clubs get it when their compute runs at the venue.
+- **Level 3 — ROADMAP: below the walk.** Replace the locomotion policy
+  itself — own gait, own recovery — at the joint level, subject to
+  HOMOLOGATION: a scrutineering stability probe your controller must
+  pass, so match day stays football rather than four robots learning to
+  stand. The bundled unitree_rl_gym policy remains the reference.
+
+Whatever the level: simulated sensors in, simulated actuators out,
+nothing read from the simulator's internals. Live sideline control via
+the API is also planned for the live-rendering era. Current contracts
+remain supported as levels arrive.
 
 ### What your player receives each decision
     obs["detections"]  what the camera can see NOW, in metres:
