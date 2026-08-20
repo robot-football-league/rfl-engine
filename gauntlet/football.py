@@ -1951,6 +1951,11 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                             ev_contact.add("robot")
                             if t - touch_t[i] > 1.0:
                                 result.robots[i].touches += 1
+                                # same debounce, same instant: the tape and
+                                # the per-robot total can never disagree
+                                result.events.append(
+                                    {"t": round(t, 2), "kind": "touch",
+                                     "who": i})
                             touch_t[i] = t
                             last_touch[0] = i
                             last_touch_team[team_of[i]] = (i, t)
@@ -2104,8 +2109,15 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                                               for px, py in post_xy) else "wall")
                     if kind:
                         last_ev_t["kick" if kind == "kick" else "wall"] = t
-                        result.events.append(
-                            {"t": round(t, 2), "kind": kind, "mag": round(dv, 2)})
+                        ev = {"t": round(t, 2), "kind": kind,
+                              "mag": round(dv, 2)}
+                        if kind == "kick":
+                            # a robot touched inside this poll window, so the
+                            # last toucher IS the kicker. Without it the tape
+                            # says a kick happened but not by whom, and every
+                            # consumer has to re-derive it from positions.
+                            ev["who"] = int(last_touch[0])
+                        result.events.append(ev)
                 # near-miss watcher: a fast ball closing on a goal mouth arms
                 # a "chance"; if no goal follows, that was a near miss
                 for s in (1, -1):
