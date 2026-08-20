@@ -98,10 +98,13 @@ def main(argv=None):
     lg.add_argument("--no-audio", action="store_true")
 
     bc = sub.add_parser("broadcast", help="Twitch: cards, program, stream")
-    bc.add_argument("action", choices=["auth", "status", "prepare", "build",
+    bc.add_argument("action", choices=["auth", "status", "preflight",
+                                       "prepare", "build",
                                        "rehearse", "live", "schedule-week", "panels",
                                        "bio"])
     bc.add_argument("--league", default="league.yaml")
+    bc.add_argument("--no-verify", action="store_true",
+                    help="status: skip the live Twitch auth check")
     bc.add_argument("--text", default=None, help="bio: override the text")
 
     cm = sub.add_parser("commentary", help="LLM script + ElevenLabs voice")
@@ -189,7 +192,17 @@ def main(argv=None):
             device_auth()
         elif args.action == "status":
             from .broadcast import status
-            status(args.league)
+            status(args.league, check_auth=not args.no_verify)
+        elif args.action == "preflight":
+            import sys as _sys
+
+            from . import alert
+            from .broadcast import preflight
+            ok, problems = preflight(args.league)
+            if not ok:
+                alert.alert("preflight FAILED — next slot will not air",
+                            "; ".join(problems), severity="error")
+                _sys.exit(1)
         elif args.action == "prepare":
             from .league import play_next
             play_next(args.league, audio=True)

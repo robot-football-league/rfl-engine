@@ -80,6 +80,13 @@ PERCEPT_PERIOD_S = 0.4
 
 MATCH_TIME_S = 90.0
 KICKOFF_FREEZE_S = 0.5   # command blend-in after each reset
+# The FULL TIME banner appears WITH the whistle, not before it. It does not
+# need a lead to be readable: broadcast_audio muxes the match with
+# `tpad=stop_mode=clone` (OUTRO_S = 8 s), so whatever is on the final frame
+# is held for eight seconds over the long whistle and the sign-off. The
+# first cut showed it from T-2.5, which put the graphic on screen a full
+# two seconds before the whistle sounded and the players stopped.
+FULL_TIME_BANNER_LEAD_S = 0.3   # = broadcast_audio's whistle onset (t_end-0.3)
 HALF_BREAK_S = 12.0      # halftime pause (banner + robots reset to
                          # kickoff): long enough to read as a real
                          # interval — whistle, stillness, whistle
@@ -489,16 +496,42 @@ HAIR_STYLES = ("none", "short", "long", "ponytail", "mohawk")
 # zero mass, zero collision, pure render geometry. The torso meshes stay
 # tinted in the kit color underneath, which is also the whole fallback
 # when a club has no kit image.
+# Jersey panels sit ON the torso shell, not in front of it. Measured off
+# the G1 torso mesh in the pelvis frame (the 12-DOF model has no separate
+# torso body, so the whole upper body is pelvis geometry):
+#
+#     chest front peaks at x=+0.080 (y=0, z=0.225), falling to +0.066 at
+#     the corners of the patch below; back is flatter, -0.071 to -0.059.
+#
+# The first cut used x=+0.148/-0.165 — sized to the invisible anti-
+# entanglement bumper capsule (r=0.2), not to the body — which left the
+# panels floating 68 mm off the chest and 94 mm off the back. The panels
+# are now small enough to sit on the flat top of the chest curve, and
+# their outer face is a hair proud of its peak: a flat panel MUST clear
+# the peak, because anywhere it sinks below the shell the body occludes
+# it and the kit simply vanishes there. Worst residual gap ~14 mm at the
+# far corners, typically far less.
+#
+# Re-measure if the G1 mesh is ever revendored: sample the torso mesh
+# verts per (y,z) cell and take the outermost x.
+JERSEY_HALF = (0.055, 0.060)        # half width (y), half height (z)
+JERSEY_FACE = {"front": 0.0802, "back": -0.0711}   # outer face, pelvis frame
+JERSEY_T = 0.003                    # half thickness
+
+
 def _add_jersey(spec, prefix: str, mat_name: str):
     body = spec.body(f"{prefix}pelvis")
-    for tag, x, quat in (
-            ("front", 0.148, [0.5, 0.5, 0.5, 0.5]),
-            ("back", -0.165, [0.5, 0.5, -0.5, -0.5])):
+    for tag, z, quat in (
+            ("front", 0.225, [0.5, 0.5, 0.5, 0.5]),
+            ("back", 0.238, [0.5, 0.5, -0.5, -0.5])):
+        face = JERSEY_FACE[tag]
+        # centre the slab so its OUTER face lands on `face`
+        x = face - JERSEY_T if tag == "front" else face + JERSEY_T
         g = body.add_geom()
         g.name = f"{prefix}jersey_{tag}"
         g.type = mujoco.mjtGeom.mjGEOM_BOX
-        g.size = [0.095, 0.095, 0.004]   # width, height, thickness (half)
-        g.pos = [x, 0.0, 0.235]
+        g.size = [*JERSEY_HALF, JERSEY_T]
+        g.pos = [x, 0.0, z]
         g.quat = quat                    # +Z faces outward, image upright
         g.material = mat_name
         g.rgba = [1.0, 1.0, 1.0, 1.0]
@@ -1138,7 +1171,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                            f"{score[1]} {team_codes[1]}")
                 elif dt_h < HALF_BREAK_S + 2.0:
                     banner("SECOND HALF", (170, 220, 255, 255))
-            if match_time_s - tt < 2.5:
+            if match_time_s - tt < FULL_TIME_BANNER_LEAD_S:
                 banner(f"FULL TIME   {team_codes[0]} {score[0]} - "
                        f"{score[1]} {team_codes[1]}")
             if tt - drop_banner[0] < 2.5:
