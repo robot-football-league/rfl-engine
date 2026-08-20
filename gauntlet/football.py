@@ -1246,6 +1246,23 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                  "applied": chosen, "status": status,
                  "latency_s": round(latency, 3), "error": error}) + "\n")
 
+    def log_dropped(i, t_now, latency, status, obs=None):
+        """Record a decision the engine THREW AWAY.
+
+        Late and hung replies never reach apply_reply, so without this they
+        are invisible in a team's own decisions.jsonl — the club sees only
+        the calls that beat the clock and concludes all is well. Silent
+        failure is the worst kind: log it where they will find it."""
+        if decisions_f:
+            obs_log = {k: v for k, v in (obs or {}).items()
+                       if not k.startswith("_")}
+            decisions_f.write(json.dumps(
+                {"robot": i, "t": round(t_now, 2), "obs": obs_log,
+                 "raw": None, "applied": None, "status": status,
+                 "latency_s": round(latency, 3),
+                 "error": f"decision discarded: {status}"}) + "\n")
+            decisions_f.flush()
+
     def deliver_message(i, text, t_now):
         """Player radio. Human-readable by league rule, logged in full and
         shown to spectators — nothing on this channel is hidden."""
@@ -1557,8 +1574,10 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                     if fallen_flags[i]:
                         continue
                     if deciders[i].in_flight_s > DECIDE_ABANDON_S:
+                        stuck = deciders[i].in_flight_s
                         deciders[i].abandon()
                         result.robots[i].abandoned += 1
+                        log_dropped(i, t, stuck, "abandoned_hung_call")
                         print(f"  [bridge] {t:5.1f}s robot {i} decision "
                               f"abandoned after {DECIDE_ABANDON_S:.0f}s in "
                               "flight (hung provider call)")
@@ -1567,6 +1586,8 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                         raw, req_t, latency, error, req_obs = reply
                         if decision_deadline_s and latency > decision_deadline_s:
                             result.robots[i].missed_deadlines += 1
+                            log_dropped(i, t, latency, "missed_deadline",
+                                        req_obs)
                         elif t < freeze_until:
                             pass        # play is stopped: the decision was
                                         # taken before the whistle and is void
