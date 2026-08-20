@@ -191,6 +191,46 @@ KICKOFFS = (  # (x, y, yaw) per robot index; A faces +x, B faces -x
 N_ROBOTS = 4
 
 
+def _stripe_texture(width: int = 512, height: int = 512) -> Path:
+    """A mown-turf tile: two bands, light and dark, with a little mottle.
+
+    Real pitches are striped because the mower lays the grass toward and
+    away from you, so alternating bands catch the light differently. One
+    tile holds exactly one there-and-back pass, so it repeats seamlessly.
+    """
+    from . import paths
+    out = paths.ROOT / "runs" / "assets" / "pitch_stripes.png"
+    if out.exists():
+        return out
+    out.parent.mkdir(parents=True, exist_ok=True)
+    import numpy as _np
+    from PIL import Image as _I
+
+    rng = _np.random.default_rng(20260820)
+    img = _np.zeros((height, width, 3), dtype=_np.float32)
+    # a mown pitch has real contrast between passes — subtle bands just
+    # read as dirty grass once the renderer minifies the texture
+    light = _np.array([0.283, 0.545, 0.290])
+    dark = _np.array([0.156, 0.345, 0.176])
+    half = width // 2
+    img[:, :half] = light
+    img[:, half:] = dark
+    # soften the seam: a mower leaves a blend, not a hard edge
+    blend = 14
+    for k in range(blend):
+        f = k / blend
+        img[:, half - blend + k] = light * (1 - f) + dark * f
+        col = (width - blend + k) % width
+        img[:, col] = dark * (1 - f) + light * f
+    # fine mottle so the turf is not a flat colour under stadium light
+    noise = rng.normal(0.0, 0.008, size=(height, width, 1))
+    noise += rng.normal(0.0, 0.010, size=(height // 32 + 1, width // 32 + 1, 1)
+                        ).repeat(32, 0).repeat(32, 1)[:height, :width]
+    img = _np.clip(img + noise, 0.0, 1.0)
+    _I.fromarray((img * 255).astype("uint8")).save(out)
+    return out
+
+
 def _pitch_xml(team_colors=TEAM_RGBA) -> str:
     root = ET.Element("mujoco", {"model": "g1_football_pitch"})
     vis = ET.SubElement(root, "visual")
@@ -205,12 +245,15 @@ def _pitch_xml(team_colors=TEAM_RGBA) -> str:
         "rgb1": "0.45 0.58 0.72", "rgb2": "0.88 0.92 0.96",
         "width": "512", "height": "3072"})
     ET.SubElement(asset, "texture", {
-        "type": "2d", "name": "pitchgrass", "builtin": "checker", "mark": "edge",
-        "rgb1": "0.22 0.44 0.24", "rgb2": "0.18 0.38 0.2",
-        "markrgb": "0.85 0.9 0.85", "width": "300", "height": "300"})
+        "type": "2d", "name": "pitchgrass", "file": str(_stripe_texture()),
+        "content_type": "image/png"})
     ET.SubElement(asset, "material", {
+        # one texture tile spans a mower's there-and-back, so texrepeat is
+        # the number of stripe PAIRS down the pitch
+        # texuniform makes texrepeat world-scaled: 0.42 puts one there-and
+        # -back pass every ~2.4 m, so the 14 m pitch carries ~12 bands
         "name": "pitchgrass", "texture": "pitchgrass",
-        "texuniform": "true", "texrepeat": "6 6", "reflectance": "0.08"})
+        "texuniform": "true", "texrepeat": "0.42 0.42", "reflectance": "0.06"})
     _texture_assets(asset)
 
     wb = ET.SubElement(root, "worldbody")
@@ -822,8 +865,12 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
             renderer.cam.lookat[:] = aim
             renderer.cam.distance = dist
             renderer.cam.azimuth = float(np.degrees(np.arctan2(v[1], v[0])))
+            # MuJoCo places the eye at lookat - distance * forward, so the
+            # forward vector IS v/dist: elevation is asin(v.z/dist) with no
+            # negation. Flipping the sign here mirrors the camera through
+            # the pitch and films the match from underground.
             renderer.cam.elevation = float(np.degrees(
-                np.arcsin(np.clip(-v[2] / (dist + 1e-9), -1.0, 1.0))))
+                np.arcsin(np.clip(v[2] / (dist + 1e-9), -1.0, 1.0))))
 
         def project(p):
             """World point -> broadcast pixel via the render camera."""
