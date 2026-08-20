@@ -92,6 +92,10 @@ EVENT_DV_MPS = 0.55      # velocity change that counts as an audible impact
 # on a ball needs finer rotation quanta — 2 s holds meant ~90 deg per decision
 # and players spun past the ball chronically (measured, match day 2)
 FOOTBALL_ROT_HOLD_S = 1.0
+KICKOFF_LEAD_S = 3.5       # teams may think during the last seconds of a
+                           # stoppage so a decision is READY at the whistle:
+                           # otherwise every restart begins with robots
+                           # standing still for a full decision round-trip
 DECIDE_ABANDON_S = 10.0    # a decision stuck in flight this long is a hung
                            # provider call, not a slow one (p99 is ~2.5 s):
                            # void it and free the decider, or one dead HTTP
@@ -587,6 +591,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
               halves: int = 1,     # 2 = two halves of match_time_s/2 each
               record_states: bool | None = None,  # None = RFL_EXPORT_STATES env
               kit_textures=None,   # {team: path-to-kit-png} for jersey panels
+              badges=None,         # {team: path-to-badge-png} for the scorebug
               video_path=None, log_dir=None) -> MatchResult:
     assert len(agents) == N_ROBOTS and mode in ("paused", "realtime")
     managers = managers or {}
@@ -756,6 +761,70 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
         renderer = EpisodeRenderer(model, video_path, track_body=None,
                                    distance=9.0, azimuth=90.0, elevation=-38.0)
 
+        # BROADCAST CAMERA. A real match camera sits in one place on the
+        # gantry and works by panning and zooming, so that is what this
+        # does: the position never moves, the aim follows the action, and
+        # the field of view opens just enough to hold every player. All of
+        # it is heavily smoothed — a camera that snaps looks like a bug,
+        # and one that lags looks like a camera operator.
+        # the position the original fixed shot was taken from — keep it, so
+        # the new camera starts from a framing we already know reads well
+        CAM_HOME = np.array([0.0, -10.64 - (1.0 if managers else 0.0), 8.71])
+        cam_state = {"aim": np.array([0.0, 0.0, 0.4]), "fov": 45.0}
+        MIN_FOV, MAX_FOV = 38.0, 52.0
+        ASPECT = 854.0 / 480.0
+
+        def aim_camera(t):
+            pts = [np.array(ctrls[i].base_pos(data)[:3]) for i in range(N_ROBOTS)
+                   if not fallen_flags[i]] or [
+                   np.array(ctrls[i].base_pos(data)[:3]) for i in range(N_ROBOTS)]
+            ball = np.array([float(data.qpos[ball_qpos_adr]),
+                             float(data.qpos[ball_qpos_adr + 1]), 0.2])
+            # the ball is the story: weight it like two outfield players
+            target = np.vstack(pts + [ball, ball]).mean(axis=0)
+            target[2] = 0.45
+            # bias toward the middle so the camera never swings to an
+            # extreme angle for one stray robot
+            target[0] *= 0.45
+
+            # ease toward the target: fast enough to keep up with a break,
+            # slow enough that a scrappy midfield does not jitter the shot
+            cam_state["aim"] += (target - cam_state["aim"]) * 0.06
+            aim = cam_state["aim"]
+
+            v = aim - CAM_HOME
+            dist = float(np.linalg.norm(v))
+            fwd = v / (dist + 1e-9)
+            # camera basis: right is horizontal, up completes the frame
+            right = np.cross(fwd, np.array([0.0, 0.0, 1.0]))
+            right /= (np.linalg.norm(right) + 1e-9)
+            up = np.cross(right, fwd)
+
+            # Size the VERTICAL fov. Horizontal spread is divided by the
+            # aspect ratio — the frame is far wider than it is tall, so
+            # sizing vertically off horizontal spread zooms way out.
+            need = 0.0
+            for q in np.vstack(pts + [ball]):
+                off = q - CAM_HOME
+                fz = float(np.dot(off, fwd)) or 1e-9
+                a_v = abs(float(np.dot(off, up))) / fz
+                a_h = abs(float(np.dot(off, right))) / fz / ASPECT
+                need = max(need, a_v, a_h)
+            # 1.45 keeps a comfortable border: nobody should be clipped to
+            # the edge of frame, which is what "all players in shot" means
+            want = float(np.clip(np.degrees(np.arctan(need)) * 2.0 * 1.45,
+                                 MIN_FOV, MAX_FOV))
+            cam_state["fov"] += (want - cam_state["fov"]) * 0.05
+            model.vis.global_.fovy = cam_state["fov"]
+
+            # aim from the fixed gantry point: derive the orbital params so
+            # the camera POSITION stays exactly at CAM_HOME
+            renderer.cam.lookat[:] = aim
+            renderer.cam.distance = dist
+            renderer.cam.azimuth = float(np.degrees(np.arctan2(v[1], v[0])))
+            renderer.cam.elevation = float(np.degrees(
+                np.arcsin(np.clip(-v[2] / (dist + 1e-9), -1.0, 1.0))))
+
         def project(p):
             """World point -> broadcast pixel via the render camera."""
             try:
@@ -777,6 +846,15 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
             cx = 854 / 2 * (1 + xn / half_w)
             cy = 480 / 2 * (1 - yn / half_h)
             return cx, cy
+
+        badge_img = {}
+        for tm, bp in (badges or {}).items():
+            try:                      # a club without a crest keeps its chip
+                from PIL import Image as _I
+                badge_img[tm] = _I.open(bp).convert("RGBA").resize(
+                    (26, 26), _I.LANCZOS)
+            except Exception:
+                pass
 
         def overlay(frame, tt):
             from PIL import Image, ImageDraw, ImageFont
@@ -872,6 +950,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                          d.textlength(nameB, font=font)) + 46
             sb_y0, sb_y1 = h - 46, h - 12
             sb_cy = (sb_y0 + sb_y1) / 2
+            side_w += 10 if badge_img else 0
             x0b, x1b = w / 2 - 46 - side_w, w / 2 + 46 + side_w
             d.rounded_rectangle([x0b, sb_y0, x1b, sb_y1], radius=9,
                                 fill=(12, 12, 18, 228))
@@ -883,10 +962,18 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                    fill=(255, 200, 60, 255), width=2)
             d.text((w / 2 + 16, sb_cy), str(score[1]), font=font_big,
                    anchor="lm", fill=(255, 255, 255, 255))
-            d.rectangle([x0b + 12, sb_y0 + 9, x0b + 26, sb_y1 - 9], fill=c0)
+            if 0 in badge_img:
+                img.paste(badge_img[0], (int(x0b + 8), int(sb_cy - 13)),
+                          badge_img[0])
+            else:
+                d.rectangle([x0b + 12, sb_y0 + 9, x0b + 26, sb_y1 - 9], fill=c0)
             d.text((w / 2 - 58, sb_cy), nameA, font=font, anchor="rm",
                    fill=(255, 255, 255, 255))
-            d.rectangle([x1b - 26, sb_y0 + 9, x1b - 12, sb_y1 - 9], fill=c1)
+            if 1 in badge_img:
+                img.paste(badge_img[1], (int(x1b - 34), int(sb_cy - 13)),
+                          badge_img[1])
+            else:
+                d.rectangle([x1b - 26, sb_y0 + 9, x1b - 12, sb_y1 - 9], fill=c1)
             d.text((w / 2 + 58, sb_cy), nameB, font=font, anchor="lm",
                    fill=(255, 255, 255, 255))
             # scorers so far on a full-width row above the bar (own goals
@@ -1084,7 +1171,13 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
     last_touch: list[int | None] = [None]  # robot index of last ball touch
     last_touch_team = {0: (None, -1e9), 1: (None, -1e9)}  # per team (j, t)
     touch_t = [-1e9] * N_ROBOTS
-    freeze_until = 0.0
+    # Opening kickoff gets the same treatment as any other restart: a short
+    # hold while both teams decide, then play begins ON the whistle instead
+    # of after a decision round-trip of standing about.
+    freeze_until = KICKOFF_FREEZE_S
+    last_reset_t = [0.0]        # when the pitch was last set for a restart
+    held_reply = [None] * N_ROBOTS   # decided during the break, applied at
+                                     # the whistle
     t = 0.0
     # halves + sound tape state
     half_banner = [-1e9]           # halftime banner start (match t)
@@ -1459,6 +1552,8 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
             bubbles[j] = ("", -1e9)   # a restart wipes the radio: chatter
             teammate_msg[j] = ""      # from before it reads as nonsense
                                       # floating over teleported players
+            held_reply[j] = None      # decided against the old positions
+        last_reset_t[0] = t
         mujoco.mj_forward(model, data)
 
     def play_goal_replay(scorer, goal_t):
@@ -1589,11 +1684,21 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                             log_dropped(i, t, latency, "missed_deadline",
                                         req_obs)
                         elif t < freeze_until:
-                            pass        # play is stopped: the decision was
-                                        # taken before the whistle and is void
+                            if req_t >= last_reset_t[0]:
+                                # decided against the restart positions: keep
+                                # it warm and play it the instant we kick off
+                                held_reply[i] = (raw, req_obs, latency, error)
+                            # otherwise it describes a world that no longer
+                            # exists — void, as before
                         else:
                             apply_reply(i, raw, t, req_obs, latency, error)
-                    if (not deciders[i].busy and t >= freeze_until
+                    if (held_reply[i] is not None and t >= freeze_until):
+                        raw_h, obs_h, lat_h, err_h = held_reply[i]
+                        held_reply[i] = None
+                        apply_reply(i, raw_h, t, obs_h, lat_h, err_h)
+                    if (not deciders[i].busy
+                            and t >= freeze_until - KICKOFF_LEAD_S
+                            and t >= last_reset_t[0]
                             and t - last_request_t[i] >= request_period - 1e-9):
                         interval = (request_period if last_request_t[i] < -1e8
                                     else t - last_request_t[i])
@@ -1997,10 +2102,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                 freeze_until = t + KICKOFF_FREEZE_S
 
             if renderer:
-                renderer.cam.lookat[0] = 0.0
-                renderer.cam.lookat[1] = -1.2 if managers else 0.0
-                renderer.cam.lookat[2] = 0.4
-                renderer.cam.distance = 14.5 if managers else 13.5
+                aim_camera(t)
                 renderer.maybe_frame(data, t)
     finally:
         if state_rec is not None and state_rec["t"]:
