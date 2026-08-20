@@ -250,10 +250,11 @@ def _pitch_xml(team_colors=TEAM_RGBA) -> str:
     ET.SubElement(asset, "material", {
         # one texture tile spans a mower's there-and-back, so texrepeat is
         # the number of stripe PAIRS down the pitch
-        # texuniform makes texrepeat world-scaled: 0.42 puts one there-and
-        # -back pass every ~2.4 m, so the 14 m pitch carries ~12 bands
+        # texuniform makes texrepeat world-scaled. One tile is a there-and
+        # -back mowing pass (2 stripes), so 0.5 = a 2 m pass = 1 m stripes:
+        # 14 across the 14 m pitch, 7 per half.
         "name": "pitchgrass", "texture": "pitchgrass",
-        "texuniform": "true", "texrepeat": "0.42 0.42", "reflectance": "0.06"})
+        "texuniform": "true", "texrepeat": "0.5 0.5", "reflectance": "0.06"})
     _texture_assets(asset)
 
     wb = ET.SubElement(root, "worldbody")
@@ -341,11 +342,65 @@ def _pitch_xml(team_colors=TEAM_RGBA) -> str:
                 "quat": " ".join(str(v) for v in quat_from_yaw(yaw)),
                 "rgba": "0.22 0.22 0.26 1"})
             k += 1
-    # halfway line + center circle (visual)
-    ET.SubElement(wb, "geom", {
-        "type": "box", "size": f"0.04 {PITCH_Y} 0.001", "pos": "0 0 0.011",
-        "rgba": "0.9 0.95 0.9 0.8", "contype": "0", "conaffinity": "0",
-        "group": "1"})
+    # PITCH MARKINGS — painted lines, scaled from a full-size pitch
+    # (105x68 m -> 14x9 m). Purely cosmetic: every one of these is
+    # collision-free and carries NO rules meaning. There is still no
+    # offside, no penalty area offence and no keeper; the boxes are paint,
+    # because a pitch without them does not read as football.
+    PAINT = "0.9 0.95 0.9 0.8"
+    LW = 0.04                                    # half-width of a line
+
+    def line(x, y, hx, hy, rgba=PAINT):
+        ET.SubElement(wb, "geom", {
+            "type": "box", "size": f"{hx} {hy} 0.001",
+            "pos": f"{x} {y} 0.011", "rgba": rgba,
+            "contype": "0", "conaffinity": "0", "group": "1"})
+
+    def arc(cx, cy, radius, segments=64, start=0.0, sweep=2 * np.pi):
+        step = sweep / segments
+        # sweep may be negative (arcs drawn clockwise); a geom size never is
+        seg_len = radius * abs(step) / 2 + LW * 0.6
+        for k in range(segments):
+            a = start + (k + 0.5) * step
+            ET.SubElement(wb, "geom", {
+                "type": "box", "size": f"{seg_len} {LW} 0.001",
+                "pos": f"{cx + radius * np.cos(a):.4f} "
+                       f"{cy + radius * np.sin(a):.4f} 0.011",
+                "quat": f"{np.cos((a + np.pi / 2) / 2):.5f} 0 0 "
+                        f"{np.sin((a + np.pi / 2) / 2):.5f}",
+                "rgba": PAINT, "contype": "0", "conaffinity": "0",
+                "group": "1"})
+
+    line(0, 0, LW, PITCH_Y)                       # halfway line
+    arc(0, 0, 1.22)                               # centre circle (9.15 m)
+    line(0, 0, 0.07, 0.07)                        # centre spot
+
+    for sgn in (-1.0, 1.0):
+        gx = sgn * PITCH_X
+        for depth, half_w in ((2.20, 2.67),       # penalty area
+                              (0.73, 1.21)):      # goal area
+            xin = gx - sgn * depth
+            line(xin, 0, LW, half_w)                          # front edge
+            for sy in (-1.0, 1.0):                            # the sides
+                line(gx - sgn * depth / 2, sy * half_w,
+                     depth / 2, LW)
+        spot_x = gx - sgn * 1.47
+        line(spot_x, 0, 0.06, 0.06)               # penalty spot (11 m)
+        # The D: the part of a centre-circle-radius arc, struck from the
+        # penalty spot, that falls OUTSIDE the penalty area.
+        box_x = gx - sgn * 2.20
+        half = float(np.arccos(np.clip(abs(box_x - spot_x) / 1.22, -1.0, 1.0)))
+        mid = np.pi if sgn > 0 else 0.0           # pointing away from goal
+        arc(spot_x, 0.0, 1.22, segments=22,
+            start=mid - half, sweep=2 * half)
+
+    for sx in (-1.0, 1.0):                        # corner arcs
+        for sy in (-1.0, 1.0):
+            a_in_x = np.arctan2(0.0, -sx)         # toward the pitch, in x
+            a_in_y = np.arctan2(-sy, 0.0)         # toward the pitch, in y
+            sweep = (a_in_y - a_in_x + np.pi) % (2 * np.pi) - np.pi
+            arc(sx * PITCH_X, sy * PITCH_Y, 0.28, segments=8,
+                start=a_in_x, sweep=sweep)
 
     # dugout stripes (visual), tinted per team, flanking the halfway line
     for tm, area in TECH_AREAS.items():

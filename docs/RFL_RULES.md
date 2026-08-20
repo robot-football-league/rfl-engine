@@ -174,6 +174,12 @@ TIME banner, and the second half kicks off (ends are not swapped — the goal
 pockets are painted in the teams' colours and are their identities). The
 scorebug clock counts down within the current half, tagged 1H/2H.
 
+The pitch carries full football markings — halfway line, centre circle,
+penalty and goal areas, penalty spots, corner arcs — but they are PAINT.
+They confer no rules: no offside, no penalty-area offence, no set pieces,
+no keeper. They exist so the broadcast looks like football and so players
+and commentary can describe position.
+
 There is NO referee ball rescue. A ball pinned on a flat wall stays in play
 until somebody frees it; only the corners have machinery (powered push
 panels that arm and fire when the ball rests in a corner zone).
