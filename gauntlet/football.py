@@ -2017,8 +2017,38 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                      else ("A" if score[0] > score[1] else "B"))
     # cost roll-up across players + managers (API usage fields; $0 for local)
     from .llm import estimate_cost
+    def billable(obj, depth=0):
+        """Every metered brain reachable from a team's player object.
+
+        Clubs legitimately WRAP an LLM agent inside their own class (own
+        prompt, own safety rails), so metering only the object the team
+        returned would miss that spend entirely and silently defeat the
+        per-match cap. Walk one level of attributes to find the real
+        agents, and never count the same object twice."""
+        found, seen_ids = [], set()
+        stack = [(obj, depth)]
+        while stack:
+            o, d = stack.pop()
+            if id(o) in seen_ids or d > 2:
+                continue
+            seen_ids.add(id(o))
+            if getattr(o, "episode_usage", None) is not None:
+                found.append(o)
+            for v in list(vars(o).values()) if hasattr(o, "__dict__") else []:
+                if hasattr(v, "__dict__"):
+                    stack.append((v, d + 1))
+                elif isinstance(v, (list, tuple)):
+                    stack.extend((x, d + 1) for x in v if hasattr(x, "__dict__"))
+        return found
+
     cost = None
-    for brain in list(agents) + list(managers.values()):
+    brains, seen = [], set()
+    for top in list(agents) + list(managers.values()):
+        for b in billable(top):
+            if id(b) not in seen:
+                seen.add(id(b))
+                brains.append(b)
+    for brain in brains:
         u = getattr(brain, "episode_usage", None) or {}
         tin, tout = u.get("input_tokens", 0), u.get("output_tokens", 0)
         result.tokens_in += tin

@@ -110,6 +110,11 @@ def play_next(league_path="league.yaml", audio=True):
         export_match(out)
     except Exception as e:      # a bundle-less match still counts
         print(f"  [volumetric] export skipped: {e}")
+    try:                        # ...then queue it on 4dgsx.com (next free
+        from .publish import publish_bundle       # broadcast slot)
+        publish_bundle(out, season=int(cfg.get("season", 1)), fixture=k + 1)
+    except Exception as e:      # an unpublished match still counts
+        print(f"  [4dgsx] publish skipped: {e}")
     print_table(league_path)
     return entry
 
