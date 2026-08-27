@@ -12,7 +12,7 @@ Player objects implement begin_episode(log_dir=None) and
 decide(obs) -> {"vx","vy","wz"}; managers decide(obs) -> {"message","move"}.
 The observation and reply contracts are published in docs/RFL_RULES.md and
 are the ONLY interface between a team and the match — players see camera
-frames and the coach radio, managers see the data feed. How a team produces
+frames and hear the pitch, managers see the data feed. How a team produces
 decisions (LLM calls with their own keys, local models, plain code) is
 entirely its own business.
 
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,7 +38,7 @@ class Team:
     name: str
     code: str          # 3-letter scorebug code
     color: tuple       # RGBA 0..1
-    color_name: str    # what the pocket paint is called over the radio
+    color_name: str    # what the pocket paint is called in shouts
     hair: object       # team look: dict, or per-player list of dicts
     players: list      # [{"name": ..., "hair": {...}}, ...] roster (optional)
     module: object
@@ -84,8 +85,17 @@ def load_team(path: str | Path) -> Team:
 def run_rfl_match(team_a_dir, team_b_dir, match_time_s: float = 90.0,
                   mode: str = "realtime", halves: int = 1,
                   record_states: bool | None = None,
+                  honest_latency: bool | None = None,
                   video_path=None, log_dir=None):
     from .football import run_match
+    if honest_latency is None:
+        # league-wide switch lives in the environment so the render pipeline
+        # can flip it per season without a code change; explicit arg wins
+        honest_latency = os.environ.get(
+            "RFL_HONEST_LATENCY", "").strip().lower() in ("1", "true", "yes")
+    if honest_latency:
+        print("  [time] HONEST LATENCY: replies land request+latency sim "
+              "seconds later — thinking costs what it costs on a real robot")
     a, b = load_team(team_a_dir), load_team(team_b_dir)
     clash = sum((x - y) ** 2 for x, y in
                 zip(a.color[:3], b.color[:3])) < 0.18
@@ -115,6 +125,7 @@ def run_rfl_match(team_a_dir, team_b_dir, match_time_s: float = 90.0,
     result = run_match(
         agents, match_time_s=match_time_s, mode=mode, halves=halves,
         decision_deadline_s=3.0, request_period_s=2.0,
+        honest_latency=honest_latency,
         managers=managers, obs_mode="sdk",
         team_colors=(a.color, b.color),
         team_color_names=(a.color_name, b.color_name),

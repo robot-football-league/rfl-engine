@@ -45,7 +45,7 @@ public: this league is also a benchmark of you.
   publicly.
 - player_model in team.yaml must be listed in data/models_registry.yaml.
   Player + manager spend is capped per match; overspend is public.
-- The player radio is natural language and fully public. Nothing on the
+- Player shouts are natural language and fully public. Nothing on the
   pitch is hidden — from spectators or from you.
 
 # Tools

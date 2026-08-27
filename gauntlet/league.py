@@ -107,7 +107,7 @@ def play_next(league_path="league.yaml", audio=True):
             print(f"  [audio] skipped: {e}")
     try:                        # volumetric replay bundle (after the audio
         from .volumetric import export_match      # mix, so it can carry it)
-        export_match(out)
+        export_match(out, fixture=k + 1)
     except Exception as e:      # a bundle-less match still counts
         print(f"  [volumetric] export skipped: {e}")
     try:                        # ...then queue it on 4dgsx.com (next free
@@ -119,9 +119,58 @@ def play_next(league_path="league.yaml", audio=True):
     return entry
 
 
-def compute_table(cfg, played):
-    """Standings rows + order for a fixture list; shared with broadcast
-    cards."""
+# --------------------------------------------------------------- movement
+# Every table the league draws — the broadcast card, the Twitch panel, the
+# website, the blog, the gaffer briefs, this CLI — shows the same up/down
+# indicator, and it means the same thing on all of them: how a club's
+# position has changed since the last COMPLETED round. That is the way a
+# football table reads "since last week", and a round here is one fixture
+# per club (len(teams) // 2 matches), so mid-round the arrows measure
+# against the last table in which every club had played the same number.
+#
+# The baseline is derived from the SAME `played` list the caller passes,
+# which is what keeps it spoiler-free: a public surface hands in aired
+# fixtures only and gets arrows computed from aired fixtures only.
+
+MOVE_UP, MOVE_DOWN, MOVE_SAME = "\u25b2", "\u25bc", "\u2013"
+
+
+def move_label(move):
+    """A club's movement as text: '\u25b22', '\u25bc1', '\u2013', or '' when there
+    is no baseline to have moved from (nobody has moved in round 1)."""
+    if move is None:
+        return ""
+    if move > 0:
+        return f"{MOVE_UP}{move}"
+    if move < 0:
+        return f"{MOVE_DOWN}{-move}"
+    return MOVE_SAME
+
+
+def baseline_count(cfg, played):
+    """How many matches deep the movement baseline sits — the end of the
+    last completed round BEFORE the current one. 0 means no baseline: in
+    round 1 there is no previous table, and comparing against an empty one
+    would invent movement out of the config's team order."""
+    per_round = max(1, len(cfg["teams"]) // 2)
+    n = len(played)
+    if n <= 0:
+        return 0
+    return per_round * (-(-n // per_round) - 1)      # ceil(n / per) - 1
+
+
+def baseline_round(cfg, played):
+    """The round number the arrows are measured from, or None if there is
+    no baseline yet. Surfaces caption themselves with this so the reader
+    knows what 'up 2' is up from."""
+    per_round = max(1, len(cfg["teams"]) // 2)
+    b = baseline_count(cfg, played)
+    return (b // per_round) or None
+
+
+def _standings(cfg, played):
+    """Rows + order with no movement attached — also the baseline pass, so
+    it must never call back into compute_table."""
     pts = cfg.get("points", {"win": 3, "draw": 1, "loss": 0})
     rows = {t: {"P": 0, "W": 0, "D": 0, "L": 0, "GF": 0, "GA": 0, "Pts": 0}
             for t in cfg["teams"]}
@@ -155,15 +204,46 @@ def compute_table(cfg, played):
     return rows, order
 
 
+def compute_table(cfg, played, baseline=None):
+    """Standings rows + order for a fixture list; shared with the broadcast
+    cards, the website feed, the blog posts and the gaffer briefs.
+
+    Every row also carries `Prev` (its position at the movement baseline)
+    and `Move` (places gained since — positive is up, negative is down,
+    None when there is no baseline). See the movement note above.
+
+    `baseline` overrides how many matches deep that baseline sits, for the
+    callers asking something other than "how has the round gone so far":
+    `len(played) - 1` asks what the LAST match alone changed, and 0 turns
+    movement off altogether. Out of range it clamps, so a caller passing
+    -1 for an empty list gets no movement rather than a table measured
+    against itself.
+    """
+    rows, order = _standings(cfg, played)
+    ordered = sorted(played, key=lambda m: m["fixture"])
+    b = (baseline_count(cfg, ordered) if baseline is None
+         else max(0, min(int(baseline), len(ordered))))
+    prev_order = _standings(cfg, ordered[:b])[1] if b else None
+    for pos, t in enumerate(order, 1):
+        prev = prev_order.index(t) + 1 if prev_order else None
+        rows[t]["Prev"] = prev
+        rows[t]["Move"] = None if prev is None else prev - pos
+    return rows, order
+
+
 def print_table(league_path="league.yaml"):
     cfg, root, state_p, state = _load(league_path)
     rows, order = compute_table(cfg, state["played"])
     names = {t: _team_name(t)["name"] for t in cfg["teams"]}
+    since = baseline_round(cfg, state["played"])
     print(f"\n{cfg.get('name', 'league')} — season {cfg.get('season', 1)} "
           f"({len(state['played'])}/{len(cfg['fixtures'])} played)")
-    print(f"  {'team':22} {'P':>2} {'W':>2} {'D':>2} {'L':>2} "
-          f"{'GF':>3} {'GA':>3} {'Pts':>4}")
-    for t in order:
+    print(f"  {'#':>2} {'':2} {'team':22} {'P':>2} {'W':>2} {'D':>2} "
+          f"{'L':>2} {'GF':>3} {'GA':>3} {'Pts':>4}")
+    for pos, t in enumerate(order, 1):
         r = rows[t]
-        print(f"  {names[t]:22} {r['P']:>2} {r['W']:>2} {r['D']:>2} "
+        print(f"  {pos:>2} {move_label(r['Move']):2} {names[t]:22} "
+              f"{r['P']:>2} {r['W']:>2} {r['D']:>2} "
               f"{r['L']:>2} {r['GF']:>3} {r['GA']:>3} {r['Pts']:>4}")
+    if since:
+        print(f"  movement since round {since}")

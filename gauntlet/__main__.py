@@ -5,9 +5,16 @@ from .cli import main
 if __name__ == "__main__":
     try:
         main()
-    except ModuleNotFoundError as e:   # public engine build: research and
-        name = e.name or ""            # station modules are not included
+    except ModuleNotFoundError as e:
+        name = e.name or ""
         if name.startswith("gauntlet"):
-            sys.exit(f"this command needs '{name}', which is not part of "
-                     "the public engine build")
+            # Two very different causes, and guessing wrong wastes an
+            # outage: the public engine build genuinely omits the station
+            # modules, but on the STATION the same error means a deploy
+            # left a file behind (2026-08-21: schedule.py had never been
+            # copied to the box at all). Name it and point at both.
+            sys.exit(f"missing module '{name}' — either this is the public "
+                     "engine build, which does not include the station "
+                     "modules, or a deploy is incomplete: check with "
+                     "scripts/deploy_box.sh")
         raise

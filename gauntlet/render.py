@@ -11,7 +11,8 @@ import numpy as np
 
 
 class VideoWriter:
-    def __init__(self, path: str | Path, width: int, height: int, fps: int):
+    def __init__(self, path: str | Path, width: int, height: int, fps: int,
+                 crf: int = 26):
         if shutil.which("ffmpeg") is None:
             raise RuntimeError("ffmpeg not found on PATH; required for MP4 replays")
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -20,7 +21,7 @@ class VideoWriter:
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-f", "rawvideo", "-pix_fmt", "rgb24",
                 "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
                 "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(path),
             ],
             stdin=subprocess.PIPE,
@@ -41,10 +42,17 @@ class EpisodeRenderer:
     track_body: body name for a tracking camera, or None for a free camera
     (set `lookat`; callers may mutate `self.cam.lookat` between frames, e.g.
     to follow the midpoint of two robots).
+
+    The defaults are the GAUNTLET's, not the broadcast's: episode.py wants a
+    cheap 480p replay. football.py asks for the TV frame explicitly
+    (TV_W/TV_H/TV_FPS), so moving the broadcast never moves anything else.
+    fps is a SAMPLING rate over sim time, not a limit of the sim — physics
+    runs at 500 Hz and control at 50 Hz, so 50 fps is one frame per control
+    tick with nothing interpolated or doubled.
     """
 
     def __init__(self, model: mujoco.MjModel, path: str | Path,
-                 width=854, height=480, fps=25,
+                 width=854, height=480, fps=25, crf=26,
                  distance=4.5, azimuth=135.0, elevation=-28.0,
                  track_body: str | None = "pelvis", lookat=(0.0, 0.0, 0.6)):
         self.model = model
@@ -61,7 +69,7 @@ class EpisodeRenderer:
         self.cam.distance = distance
         self.cam.azimuth = azimuth
         self.cam.elevation = elevation
-        self.writer = VideoWriter(path, width, height, fps)
+        self.writer = VideoWriter(path, width, height, fps, crf)
         self._frame_period = 1.0 / fps
         self._next_frame_t = 0.0
 

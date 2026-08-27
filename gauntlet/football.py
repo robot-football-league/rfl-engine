@@ -64,6 +64,14 @@ FOOTBALL_CAM_PITCH_RAD = 0.38  # ~22 deg
 # reason players "never walked at the ball". Bottom edge sits 62.9 deg below
 # horizon: ground blind spot 0.23 m, better than before.
 FOOTBALL_CAM_W, FOOTBALL_CAM_H = 480, 240
+# BROADCAST FRAME. Every graphic in `overlay` is laid out against BASE_W x
+# BASE_H in absolute pixels; gauntlet.draw2d.Scaled multiplies them up to
+# whatever TV_W x TV_H actually is, so the layout is authored once. Keep
+# BASE 16:9 and TV 16:9 — 4DGSX size their XR screen off the video itself.
+BASE_W, BASE_H = 854, 480
+# the broadcast's own frame — the cards and this render are concatenated with
+# `-c copy`, so they must be the SAME numbers, not two copies of them
+from .broadcast import TV_CRF, TV_FPS, TV_H, TV_W  # noqa: E402
 FOOTBALL_CAM_FOVY = 81.8
 # the frame pair is a MOTION BURST, not a history: the older frame is taken
 # PREFRAME_LEAD_S before the request. It used to be the previous request's
@@ -143,6 +151,10 @@ CORNER_EXTEND_S = 0.9       # extend time (=> ~0.7 m/s panel speed)
 CORNER_HOLD_S = 0.4
 CORNER_RETRACT_S = 1.2      # retract gently
 CORNER_COOLDOWN_S = 2.0
+# The end walls straddle the goal line, so they offer only WALL_T of material
+# outboard where the side walls offer 2*WALL_T. Extending them outward (the
+# inner face never moves) gives a corner panel somewhere to bury its end.
+END_WALL_EXT = 0.05
 
 # Referee dropped-ball is DISABLED by default (league experiment: with corner
 # rams + anti-entanglement bumpers, flat-wall balls should be freeable by
@@ -157,6 +169,12 @@ STUCK_ENGAGE_M = 2.0
 BALL_WALL_M = 0.75        # "against a wall" for the behaviour layer's benefit
 
 REPLAY_S = 5.0
+# play_goal_replay emits ONE output frame per buffered snapshot, so the
+# buffer has to be sampled at the video frame rate or the replay plays at
+# the wrong speed. This constant is only the fallback for a renderer that
+# does not state its fps — run_match reads renderer.fps. It happened to
+# equal TV_FPS until the broadcast moved to 50, and then every replay ran
+# at 2x (5 s of match in 2.5 s of video) for m11-m14 before anyone saw it.
 REPLAY_SAMPLE_HZ = 25.0
 # VOLUMETRIC EXPORT: full-scene pose track (every body, 25 Hz) written to
 # log_dir/states.npz + the compiled model to scene.mjb. Enough to re-pose the
@@ -167,19 +185,20 @@ BUBBLE_S = 3.5            # how long a speech bubble stays above a player
 
 # managers: one LLM per team, each in its own dugout on the south touchline.
 # Full game data arrives every MANAGER_POLL_S; SHOUTING is rationed — at most
-# one <=240-char instruction per MANAGER_SHOUT_S (a coach radio, not a
+# one <=240-char instruction per MANAGER_SHOUT_S (a touchline shout, not a
 # control bus). An empty message is a choice to stay silent.
 MANAGER_POLL_S = 10.0
 MANAGER_SHOUT_S = 20.0
 MANAGER_MSG_MAX = 240
-# player-to-player radio. League rule: plain human-readable language only —
-# every message is logged and shown on the broadcast, so spectators always
-# see the full picture. Nothing on this channel is hidden.
+# player shouts. There is no radio — robots get the same channel humans
+# have: a voice. League rule: plain human-readable language only — every
+# shout is logged and shown on the broadcast, so spectators always see the
+# full picture. Nothing shouted on the pitch is hidden.
 MESSAGE_MAX = 120
-# radio discipline: at most one message per player per cooldown, and no
+# shout discipline: at most one shout per player per cooldown, and no
 # repeating yourself. Without this players talked on every single decision
 # (228 messages in a 120 s match), which buries the spectator in captions.
-PLAYER_RADIO_COOLDOWN_S = 10.0
+PLAYER_SHOUT_COOLDOWN_S = 10.0
 SKILL_NAMES = ("go_to_ball", "kick_toward", "walk_to", "turn_to", "hold")
 TECH_AREAS = {  # team -> (x0, x1, y0, y1), dugouts flanking the halfway line
     0: (-4.6, -1.6, -6.3, -5.3),
@@ -295,8 +314,17 @@ def _pitch_xml(team_colors=TEAM_RGBA) -> str:
                    "w": " ".join(f"{v:.3g}" for v in team_colors[0])}
     for sgn, tag in ((1, "e"), (-1, "w")):
         gx = sgn * PITCH_X
-        wall(f"wall_{tag}_top", gx, GOAL_HALF_W + seg, WALL_T, seg)
-        wall(f"wall_{tag}_bot", gx, -GOAL_HALF_W - seg, WALL_T, seg)
+        # The end walls STRADDLE the goal line while the side walls sit
+        # wholly outboard of PITCH_Y, so an end wall offers a corner panel
+        # only WALL_T of material to bury its end in where the side wall
+        # offers 2*WALL_T. A panel laid out symmetrically about the corner
+        # buried fine in one and punched 82 mm out through the other.
+        # Thicken these OUTWARD only: the inner face — the one the ball
+        # hits — stays exactly where it was, at gx - sgn * WALL_T.
+        wall(f"wall_{tag}_top", gx + sgn * END_WALL_EXT, GOAL_HALF_W + seg,
+             WALL_T + END_WALL_EXT, seg)
+        wall(f"wall_{tag}_bot", gx + sgn * END_WALL_EXT, -GOAL_HALF_W - seg,
+             WALL_T + END_WALL_EXT, seg)
         # net back wall + pocket sides, team-colored
         pc = pocket_rgba[tag]
         wall(f"net_{tag}_back", sgn * (PITCH_X + GOAL_DEPTH), 0, WALL_T, GOAL_HALF_W, rgba=pc)
@@ -314,7 +342,37 @@ def _pitch_xml(team_colors=TEAM_RGBA) -> str:
             "conaffinity": "3"})       # solid, like the posts and walls
     # 45-degree corner bevels: a ball pushed into a corner deflects back into
     # play instead of deadlocking (standard walled-pitch design)
-    bev = 1.1
+    # BEVEL WIDTH is a physics parameter, not a look: it is the surface a
+    # cornered ball rebounds off. Widened 1.1 -> 1.7 on 2026-08-21 so the
+    # ram's actuator can be drawn where it actually is. A linear actuator's
+    # housing must be DEEPER than its stroke — it swallows the shaft at rest
+    # — so a 0.65 m stroke needs ~0.8 m of housing behind the panel, while
+    # the recess behind a 1.1 m bevel was 0.64 m and narrowing to a point.
+    # Below bev = 1.55 nothing fits and the hardware has to be hidden.
+    # Costs 2.7% of playable area. See config/NOTICES.md 2026-08-21.
+    bev = 1.7
+    # Panel half-length: long enough to seal both wall joints, short enough
+    # that both buried ends stay inside the wall skin. Derived, not guessed
+    # — the old hand-picked 0.85*bev punched 82 mm out through the end wall.
+    panel_half = (np.sqrt(2) * (bev / 2 + WALL_T + 2 * END_WALL_EXT)
+                  - WALL_T - 0.02)
+    # Actuator, now that there is room for it. HOUSE_D is the housing centre
+    # along the panel's outward normal; the shaft is welded to the panel and
+    # must still be inside the housing when the panel is fully extended.
+    HOUSE_HV = (CORNER_STROKE_M + 0.15) / 2
+    HOUSE_HU, HOUSE_HZ = 0.12, 0.14
+    HOUSE_D = WALL_T + 0.02 + HOUSE_HV
+    SHAFT_TIP = HOUSE_D - HOUSE_HV + CORNER_STROKE_M + 0.11
+    # The panel overhangs the 45-degree chord so its joints with the walls
+    # seal, which buries each end INSIDE wall material — and a buried end
+    # puts the panel's top face at exactly z = WALL_H, coplanar with the
+    # wall's own top face. Coplanar faces z-fight, and a z-fight flickers
+    # frame to frame on air. So the panel is drawn twice: a collision hull
+    # at full height that nobody renders (group 3 — MuJoCo's renderer and
+    # the 4DGSX exporter both stop at group 2), and a visible face 4 mm
+    # shorter that loses the depth test cleanly. Nothing the ball can
+    # touch has moved: the hull is the geometry that was always there.
+    PANEL_DROP = 0.004
     k = 0
     for sx in (1, -1):
         for sy in (1, -1):
@@ -325,29 +383,53 @@ def _pitch_xml(team_colors=TEAM_RGBA) -> str:
                 "name": f"corner_{k}", "mocap": "true",
                 "pos": f"{cx} {cy} {WALL_H / 2}",
                 "quat": " ".join(str(v) for v in quat_from_yaw(yaw))})
-            ET.SubElement(body, "geom", {
+            ET.SubElement(body, "geom", {       # collision hull, unseen
                 "name": f"corner_panel_{k}", "type": "box",
-                "size": f"{bev * 0.85} {WALL_T} {WALL_H / 2}",
-                "conaffinity": "3",
+                "size": f"{panel_half} {WALL_T} {WALL_H / 2}",
+                "conaffinity": "3", "group": "3",
                 "rgba": "0.75 0.75 0.78 1"})
-            # actuator rod, BEHIND the panel (outward, into the corner):
-            # local +y is the outward normal for this panel's yaw
+            ET.SubElement(body, "geom", {       # what the camera sees
+                "name": f"corner_face_{k}", "type": "box",
+                "size": f"{panel_half} {WALL_T} {WALL_H / 2 - PANEL_DROP / 2}",
+                "pos": f"0 0 {-PANEL_DROP / 2}",
+                "contype": "0", "conaffinity": "0",
+                "rgba": "0.75 0.75 0.78 1"})
+            # SHAFT: welded to the panel, so it travels with it. Drawn
+            # from the panel's back face out to SHAFT_TIP, which is chosen
+            # so the tip is STILL inside the housing at full extension —
+            # the old rod was exactly one stroke long and pulled clean out
+            # of its housing every time the ram fired, leaving a bar
+            # hanging in mid-air.
             ET.SubElement(body, "geom", {
-                "type": "cylinder", "size": f"0.05 {CORNER_STROKE_M / 2}",
-                "pos": f"0 {CORNER_STROKE_M / 2 + WALL_T} 0.0",
+                "type": "cylinder",
+                "size": f"0.05 {(SHAFT_TIP - WALL_T) / 2}",
+                "pos": f"0 {(SHAFT_TIP + WALL_T) / 2} 0.0",
                 "quat": "0.7071 0.7071 0 0",
                 "rgba": "0.32 0.32 0.36 1", "contype": "0", "conaffinity": "0",
                 "group": "1"})
-            # fixed housing bolted in the corner; the rod slides out of it
+            # HOUSING: fixed in the corner recess, deeper than the stroke.
             outx, outy = sx / np.sqrt(2), sy / np.sqrt(2)
-            hx = cx + outx * (CORNER_STROKE_M + 0.22)
-            hy = cy + outy * (CORNER_STROKE_M + 0.22)
             ET.SubElement(wb, "geom", {
                 "name": f"corner_housing_{k}", "type": "box",
-                "size": f"0.16 0.13 0.16",
-                "pos": f"{hx} {hy} {WALL_H / 2}",
+                "size": f"{HOUSE_HU} {HOUSE_HV} {HOUSE_HZ}",
+                "pos": f"{cx + outx * HOUSE_D} {cy + outy * HOUSE_D} "
+                       f"{WALL_H / 2}",
                 "quat": " ".join(str(v) for v in quat_from_yaw(yaw)),
-                "rgba": "0.22 0.22 0.26 1"})
+                "rgba": "0.22 0.22 0.26 1", "contype": "0",
+                "conaffinity": "0"})
+            # ...and a plinth, because the housing has to stand on
+            # something. Invisible from pitch level behind a 0.9 m panel,
+            # but a 4DGSX viewer can orbit into the recess and a box
+            # hovering in mid-air is exactly what they would notice.
+            ET.SubElement(wb, "geom", {
+                "name": f"corner_plinth_{k}", "type": "box",
+                "size": f"{HOUSE_HU * 0.8} {HOUSE_HV * 0.7} "
+                        f"{(WALL_H / 2 - HOUSE_HZ) / 2}",
+                "pos": f"{cx + outx * HOUSE_D} {cy + outy * HOUSE_D} "
+                       f"{(WALL_H / 2 - HOUSE_HZ) / 2}",
+                "quat": " ".join(str(v) for v in quat_from_yaw(yaw)),
+                "rgba": "0.18 0.18 0.21 1", "contype": "0",
+                "conaffinity": "0"})
             k += 1
     # PITCH MARKINGS — painted lines, scaled from a full-size pitch
     # (105x68 m -> 14x9 m). Purely cosmetic: every one of these is
@@ -401,13 +483,11 @@ def _pitch_xml(team_colors=TEAM_RGBA) -> str:
         arc(spot_x, 0.0, 1.22, segments=22,
             start=mid - half, sweep=2 * half)
 
-    for sx in (-1.0, 1.0):                        # corner arcs
-        for sy in (-1.0, 1.0):
-            a_in_x = np.arctan2(0.0, -sx)         # toward the pitch, in x
-            a_in_y = np.arctan2(-sy, 0.0)         # toward the pitch, in y
-            sweep = (a_in_y - a_in_x + np.pi) % (2 * np.pi) - np.pi
-            arc(sx * PITCH_X, sy * PITCH_Y, 0.28, segments=8,
-                start=a_in_x, sweep=sweep)
+    # NO CORNER ARCS. They mark where a corner kick is taken, and there is
+    # no corner kick here — nor, after the 1.1 m bevel, any corner to take
+    # it from. Struck at (±PITCH_X, ±PITCH_Y) they landed 0.6 m BEHIND the
+    # ram panel, in the sealed dead triangle: invisible during play, then
+    # popping into shot for a second and a half every time a ram fired.
 
     # dugout stripes (visual), tinted per team, flanking the halfway line
     for tm, area in TECH_AREAS.items():
@@ -664,6 +744,7 @@ class MatchResult:
     tokens_out: int = 0
     est_cost_usd: float | None = None  # None when no priced model played
     wall_time_s: float = 0.0
+    honest_latency: bool = False  # replies charged their wall latency in sim time
 
     def to_dict(self):
         return asdict(self)
@@ -712,9 +793,10 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
               mode: str = "paused", realtime_factor: float = 1.0,
               decision_deadline_s: float | None = None,
               request_period_s: float | None = None,
+              honest_latency: bool = False,
               managers: dict | None = None,  # {team_idx: agent}
               manager_period_s: float = MANAGER_POLL_S,
-              obs_mode: str = "full",  # full | camera (camera+radio only)
+              obs_mode: str = "full",  # full | camera (camera+shouts only)
               team_colors=TEAM_RGBA, team_color_names=TEAM_COLOR_NAMES,
               team_names=TEAM_NAMES, team_codes=TEAM_CODES, hair=None,
               referee_drop: bool = REFEREE_DROP_DEFAULT,
@@ -752,11 +834,13 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
     for k in range(4):
         bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"corner_{k}")
         gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, f"corner_panel_{k}")
+        vgid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, f"corner_face_{k}")
         mid = model.body_mocapid[bid]
         rest = np.array(model.body_pos[bid], dtype=float)
         inward = np.array([-np.sign(rest[0]), -np.sign(rest[1]), 0.0])
         inward /= (np.linalg.norm(inward) or 1.0)
-        corners.append({"gid": gid, "mid": mid, "rest": rest, "inward": inward,
+        corners.append({"gid": gid, "vgid": vgid,  # hull collides, face shows
+                        "mid": mid, "rest": rest, "inward": inward,
                         "charge": 0.0, "phase": None, "phase_t": 0.0,
                         "last_touch_t": -1e9})
     robot_geoms = [set() for _ in range(N_ROBOTS)]
@@ -834,6 +918,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
     falls = [FallTracker() for _ in range(n_bodies)]
     fallen_flags = [False] * n_bodies
     result = MatchResult(mode=mode, match_time_s=match_time_s, halves=halves,
+                         honest_latency=bool(honest_latency and mode == "realtime"),
                          teams={k: {"name": team_names[tm],
                                     "code": team_codes[tm],
                                     "color": team_color_names[tm],
@@ -890,6 +975,8 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
     renderer = None
     if video_path:
         renderer = EpisodeRenderer(model, video_path, track_body=None,
+                                   width=TV_W, height=TV_H, fps=TV_FPS,
+                                   crf=TV_CRF,
                                    distance=9.0, azimuth=90.0, elevation=-38.0)
 
         # BROADCAST CAMERA. A real match camera sits in one place on the
@@ -903,7 +990,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
         CAM_HOME = np.array([0.0, -10.64 - (1.0 if managers else 0.0), 8.71])
         cam_state = {"aim": np.array([0.0, 0.0, 0.4]), "fov": 45.0}
         MIN_FOV, MAX_FOV = 38.0, 52.0
-        ASPECT = 854.0 / 480.0
+        ASPECT = BASE_W / BASE_H
 
         def aim_camera(t):
             pts = [np.array(ctrls[i].base_pos(data)[:3]) for i in range(N_ROBOTS)
@@ -977,34 +1064,28 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
             xn = float(rel @ right) / z * glcam.frustum_near
             yn = float(rel @ up) / z * glcam.frustum_near
             half_h = (glcam.frustum_top - glcam.frustum_bottom) / 2
-            half_w = half_h * (854 / 480)
-            cx = 854 / 2 * (1 + xn / half_w)
-            cy = 480 / 2 * (1 - yn / half_h)
-            return cx, cy
+            half_w = half_h * (BASE_W / BASE_H)
+            cx = BASE_W / 2 * (1 + xn / half_w)
+            cy = BASE_H / 2 * (1 - yn / half_h)
+            return cx, cy      # BASE-space pixels; Scaled maps them up
 
         badge_img = {}
         for tm, bp in (badges or {}).items():
             try:                      # a club without a crest keeps its chip
                 from PIL import Image as _I
-                badge_img[tm] = _I.open(bp).convert("RGBA").resize(
-                    (26, 26), _I.LANCZOS)
+                badge_img[tm] = _I.open(bp).convert("RGBA")
             except Exception:
                 pass
 
         def overlay(frame, tt):
-            from PIL import Image, ImageDraw, ImageFont
-            try:
-                font = ImageFont.load_default(size=15)
-            except TypeError:  # older Pillow: no size kwarg
-                font = ImageFont.load_default()
-            try:
-                font_big = ImageFont.load_default(size=22)
-                font_sm = ImageFont.load_default(size=12)
-            except TypeError:
-                font_big = font_sm = font
+            from PIL import Image, ImageDraw
+
+            from .draw2d import Scaled
             img = Image.fromarray(frame)
-            d = ImageDraw.Draw(img, "RGBA")
-            h, w = frame.shape[0], frame.shape[1]
+            d = Scaled(ImageDraw.Draw(img, "RGBA"), frame.shape[0] / BASE_H)
+            font, font_big, font_sm = d.font(15), d.font(22), d.font(12)
+            # lay out in BASE space whatever the real frame is; `d` scales
+            h, w = BASE_H, BASE_W
 
             def ink_on(rgb):
                 """Dark or light text so it always reads on a team color."""
@@ -1098,15 +1179,15 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
             d.text((w / 2 + 16, sb_cy), str(score[1]), font=font_big,
                    anchor="lm", fill=(255, 255, 255, 255))
             if 0 in badge_img:
-                img.paste(badge_img[0], (int(x0b + 8), int(sb_cy - 13)),
-                          badge_img[0])
+                d.paste(img, d.sized(badge_img[0], 26, 26),
+                        (x0b + 8, sb_cy - 13), badge_img[0])
             else:
                 d.rectangle([x0b + 12, sb_y0 + 9, x0b + 26, sb_y1 - 9], fill=c0)
             d.text((w / 2 - 58, sb_cy), nameA, font=font, anchor="rm",
                    fill=(255, 255, 255, 255))
             if 1 in badge_img:
-                img.paste(badge_img[1], (int(x1b - 34), int(sb_cy - 13)),
-                          badge_img[1])
+                d.paste(img, d.sized(badge_img[1], 26, 26),
+                        (x1b - 34, sb_cy - 13), badge_img[1])
             else:
                 d.rectangle([x1b - 26, sb_y0 + 9, x1b - 12, sb_y1 - 9], fill=c1)
             d.text((w / 2 + 58, sb_cy), nameB, font=font, anchor="lm",
@@ -1185,7 +1266,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                 d.rounded_rectangle([w // 2 - 130, 46, w // 2 + 130, 76],
                                     radius=8, fill=(12, 12, 18, 220))
                 d.text((w // 2 - 112, 54),
-                       f"GOAL!  {team_names[gteam][:24]}",
+                       f"GOAL!  {team_names[gteam][:24]}", font=font,
                        fill=_vivid(c0 if gteam == 0 else c1))
             # corner ram countdown, drawn at the corner it belongs to
             for cn in corners:
@@ -1207,7 +1288,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                                     outline=col, width=2)
                 d.text((cxp - tw / 2 + 6, cyp - 8), label, fill=col, font=font)
 
-            # SPEECH BUBBLES: player radio floats above the speaker and tracks
+            # SPEECH BUBBLES: player shouts float above the speaker and track
             # them, so spectators always see who said what and where
             pending = []
             for j in range(N_ROBOTS):
@@ -1273,7 +1354,8 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                             or f" {team_codes[0][:3]}:" in s)
                     base = c0 if home else c1
                     col = tuple(min(255, v + 90) for v in base[:3]) + (255,)
-                    d.text((8, sub_b - band + 6 + 14 * li), s[:130], fill=col)
+                    d.text((8, sub_b - band + 6 + 14 * li), s[:130],
+                           font=font_sm, fill=col)
             return np.asarray(img)
 
         renderer.overlay_fn = overlay
@@ -1282,6 +1364,14 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
     consecutive_invalid = [0] * N_ROBOTS
     latencies = [[] for _ in range(N_ROBOTS)]
     deciders = [_AsyncDecider(a) for a in agents] if mode == "realtime" else None
+    # HONEST LATENCY: a completed reply is held here until sim time reaches
+    # request_t + wall_latency, so thinking costs the same number of SIM
+    # seconds it cost wall seconds — the way a physical robot would pay for
+    # it. Without this, a loop running Nx slower than sim time (see the
+    # realtime-sleep note below) divides every decider's effective latency
+    # by N, and N has varied 3.4x-29x across season 2 with the machine's
+    # mood. While a reply is held the brain counts as busy: no new request.
+    arrival: list = [None] * N_ROBOTS
     last_request_t = [-1e9] * N_ROBOTS
     prev_decision_t: list[float | None] = [None] * N_ROBOTS
     cmd_applied_t: list[float | None] = [None] * N_ROBOTS
@@ -1294,14 +1384,19 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
     last_skill = [{"skill": "hold", "target": None, "status": "ok"}
                   for _ in range(N_ROBOTS)]
     teammate_msg = [""] * N_ROBOTS
+    opponent_msg = [""] * N_ROBOTS    # latest opposition shout overheard
     bubbles: list[tuple] = [("", -1e9)] * N_ROBOTS   # (text, said_at) per player
-    say_ok_t = [0.0] * N_ROBOTS                      # radio cooldown per player
+    say_ok_t = [0.0] * N_ROBOTS                      # shout cooldown per player
     last_said = [""] * N_ROBOTS
     recover_at: list[float | None] = [None] * N_ROBOTS
     stuck_ref = [0.0, (0.0, 0.0)]   # (since_t, ball xy) for the stuck rule
     drop_banner = [-1e9]
     replay_buf: list = []          # rolling qpos snapshots for goal replays
     next_replay_t = [0.0]
+    # one snapshot per output frame => sample at the WRITER's rate, never a
+    # constant; any mismatch between the two is a playback-speed change
+    replay_hz = float(getattr(renderer, "fps", REPLAY_SAMPLE_HZ)
+                      or REPLAY_SAMPLE_HZ)
     score = [0, 0]
     last_touch: list[int | None] = [None]  # robot index of last ball touch
     last_touch_team = {0: (None, -1e9), 1: (None, -1e9)}  # per team (j, t)
@@ -1336,6 +1431,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
     tactics_f = open(log_dir / "tactics.jsonl", "w") if log_dir else None
     subtitles = {0: "", 1: ""}  # per-team lines for the overlay closure
     mgr_next_t = {tm: 0.0 for tm in managers}       # next data poll
+    mgr_arrival: dict = {tm: None for tm in managers}  # honest-latency hold
     mgr_shout_ok = {tm: 0.0 for tm in managers}     # next allowed shout
     mgr_deciders = ({tm: _AsyncDecider(a) for tm, a in managers.items()}
                     if mode == "realtime" else None)
@@ -1379,7 +1475,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
         msg = raw.get("message")
         if isinstance(msg, str) and msg.strip():
             if t_now + 1e-9 < mgr_shout_ok[team]:
-                if tactics_f:  # shouted too soon: radio drops it
+                if tactics_f:  # shouted too soon: the league drops it
                     tactics_f.write(json.dumps(
                         {"t": round(t_now, 1),
                          "team": "A" if team == 0 else "B",
@@ -1443,7 +1539,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                                      else list(target) if target else None),
                           "lead_s": lead}
                 last_skill[i] = {**chosen, "status": "ok"}
-            # spectator-visible player-to-player radio
+            # spectator-visible player shout
             say = raw.get("say")
             if isinstance(say, str) and say.strip():
                 deliver_message(i, say, t_now)
@@ -1492,12 +1588,17 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
             decisions_f.flush()
 
     def deliver_message(i, text, t_now):
-        """Player radio. Human-readable by league rule, logged in full and
-        shown to spectators — nothing on this channel is hidden."""
+        """A player shout. Human-readable by league rule, logged in full and
+        shown to spectators — nothing shouted on the pitch is hidden.
+
+        Everyone in earshot hears it, and on a pitch this size that is
+        everyone: the teammate it was meant for AND both opponents (their
+        obs carries it as opponent_says). Same rule humans play under —
+        shout "square it!" and the defender hears it too."""
         clean = "".join(ch for ch in str(text) if ch.isprintable()).strip()[:MESSAGE_MAX]
         if not clean:
             return
-        # radio discipline: cooldown per player, and no repeats
+        # shout discipline: cooldown per player, and no repeats
         too_soon = t_now < say_ok_t[i]
         repeat = clean.lower() == last_said[i].lower()
         if too_soon or repeat:
@@ -1508,12 +1609,15 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                      "suppressed": clean,
                      "reason": "repeat" if repeat else "cooldown"}) + "\n")
             return
-        say_ok_t[i] = t_now + PLAYER_RADIO_COOLDOWN_S
+        say_ok_t[i] = t_now + PLAYER_SHOUT_COOLDOWN_S
         last_said[i] = clean
         mate = i + 1 if i % 2 == 0 else i - 1
         teammate_msg[mate] = clean
+        for j in range(N_ROBOTS):
+            if team_of[j] != team_of[i]:
+                opponent_msg[j] = clean
         bubbles[i] = (clean, t_now)     # spectators see it above the player
-        print(f"  [radio] {t_now:5.1f}s #{i % 2 + 1} "
+        print(f"  [shout] {t_now:5.1f}s #{i % 2 + 1} "
               f"{team_codes[team_of[i]]}: {clean}")
         if comms_f:
             comms_f.write(json.dumps({"t": round(t_now, 1), "from": f"r{i}",
@@ -1605,6 +1709,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                 "field": {"length_m": 2 * PITCH_X, "width_m": 2 * PITCH_Y,
                           "goal_width_m": 2 * GOAL_HALF_W},
                 "teammate_says": teammate_msg[i],
+                "opponent_says": opponent_msg[i],
                 "last_skill": last_skill[i],
                 "camera": {"frames": 2, "note": "raw frames also attached "
                            "(_frames) if you prefer your own vision"},
@@ -1614,7 +1719,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
             obs["_frame"] = frame
             return obs
         if obs_mode == "camera":
-            # the real-life contract: onboard senses + the coach radio only.
+            # the real-life contract: onboard senses + the coach's shouts only.
             # No positions of anything — the ball, mates, opponents, and the
             # colored goals exist solely in the attached camera frames.
             c = ctrls[i]
@@ -1684,9 +1789,9 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
             if skills is not None:
                 skills[i].skill, skills[i].path = "hold", []
         for j in range(N_ROBOTS):
-            bubbles[j] = ("", -1e9)   # a restart wipes the radio: chatter
+            bubbles[j] = ("", -1e9)   # a restart wipes the shouts: chatter
             teammate_msg[j] = ""      # from before it reads as nonsense
-                                      # floating over teleported players
+            opponent_msg[j] = ""      # floating over teleported players
             held_reply[j] = None      # decided against the old positions
         last_reset_t[0] = t
         mujoco.mj_forward(model, data)
@@ -1708,6 +1813,8 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
         except Exception:
             return 0.0, 0.0
         t_wall0 = time.time()
+        # the "scorer cam" tag blinks on a period in SECONDS, not in frames
+        blink_n = max(1, round(replay_hz * 0.24))
         save_q, save_v = data.qpos.copy(), data.qvel.copy()
         # name the scorer, not just their shirt: "#1 CR-7000 (RMA)"
         who = (f"#{scorer % 2 + 1} {pname(scorer)} "
@@ -1741,7 +1848,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                        fill=(235, 55, 45, 255))
             dr.text((wv - 16 - rep_w, 21), "REPLAY",
                     fill=(255, 255, 255, 255), font=font_r, anchor="lm")
-            if (n // 6) % 2 == 0:      # blinking "scorer cam" tag
+            if (n // blink_n) % 2 == 0:   # blinking "scorer cam" tag
                 tag = f"{who} head camera"
                 tw_ = dr.textlength(tag, font=font_r)
                 dr.rounded_rectangle([14, hv - 34, 26 + tw_, hv - 8],
@@ -1756,8 +1863,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
         replay_buf.clear()
         print(f"  [replay] goal by {who}: {wrote} frames from the scorer's "
               f"head camera ({time.time() - t_wall0:.1f}s to render)")
-        fps = getattr(renderer, "fps", 25) or 25
-        return time.time() - t_wall0, round(wrote / fps, 2)
+        return time.time() - t_wall0, round(wrote / replay_hz, 2)
 
     wall_start = time.time()
     try:
@@ -1812,6 +1918,14 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                               f"abandoned after {DECIDE_ABANDON_S:.0f}s in "
                               "flight (hung provider call)")
                     reply = deciders[i].poll()
+                    if honest_latency:
+                        if reply is not None:      # done thinking in WALL terms
+                            arrival[i] = reply
+                            reply = None
+                        if (arrival[i] is not None
+                                and t >= arrival[i][1] + arrival[i][2]):
+                            reply = arrival[i]     # sim has caught up: deliver
+                            arrival[i] = None
                     if reply is not None:
                         raw, req_t, latency, error, req_obs = reply
                         if decision_deadline_s and latency > decision_deadline_s:
@@ -1832,6 +1946,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                         held_reply[i] = None
                         apply_reply(i, raw_h, t, obs_h, lat_h, err_h)
                     if (not deciders[i].busy
+                            and arrival[i] is None
                             and t >= freeze_until - KICKOFF_LEAD_S
                             and t >= last_reset_t[0]
                             and t - last_request_t[i] >= request_period - 1e-9):
@@ -1843,9 +1958,18 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                     if dec.in_flight_s > MGR_ABANDON_S:
                         dec.abandon()
                     reply = dec.poll()
+                    if honest_latency:
+                        if reply is not None:
+                            mgr_arrival[tm] = reply
+                            reply = None
+                        if (mgr_arrival[tm] is not None
+                                and t >= mgr_arrival[tm][1] + mgr_arrival[tm][2]):
+                            reply = mgr_arrival[tm]
+                            mgr_arrival[tm] = None
                     if reply is not None:
                         apply_manager_reply(tm, reply[0], t)
-                    if not dec.busy and t >= mgr_next_t[tm]:
+                    if (not dec.busy and mgr_arrival[tm] is None
+                            and t >= mgr_next_t[tm]):
                         dec.submit(manager_obs(tm), t)
                         mgr_next_t[tm] = t + manager_period_s
 
@@ -1881,6 +2005,26 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
             t += dt
 
             if mode == "realtime":
+                # This sleep only engages when the loop is running FASTER
+                # than sim time, and a league match never is — m1-m11 ran
+                # 3.4x to 9.2x slower, paced by how long the gaffers take to
+                # answer. So the wall-clock-per-sim-second ratio is a real
+                # quantity that varies per match, and anything that slows the
+                # loop raises it: making the render heavier (854x480/25 ->
+                # 1280x720/50 on 2026-08-21) is one such thing.
+                #
+                # It matters because the deciders are ASYNCHRONOUS: an agent
+                # thinks in wall time while the sim advances, so a slower
+                # loop means fewer sim steps pass before its answer lands,
+                # and the players effectively react sooner. That is a
+                # fairness property, not a cosmetic one.
+                #
+                # Measured, not assumed: m11 (the first 720p50 match) came in
+                # at 6.88x, inside the 3.37x-9.22x spread of the ten 480p25
+                # matches before it. The render's contribution is swamped by
+                # LLM latency variance, so no notice was owed. Re-check this
+                # if the render ever gets heavier again, or if the gaffers
+                # get much faster and stop dominating the ratio.
                 target = wall_start + t / realtime_factor
                 ahead = target - time.time()
                 if ahead > 0.002:
@@ -2051,8 +2195,8 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
 
             if renderer is not None and t >= next_replay_t[0] - 1e-9:
                 replay_buf.append((t, data.qpos.copy()))
-                del replay_buf[:-int(REPLAY_S * REPLAY_SAMPLE_HZ)]
-                next_replay_t[0] += 1.0 / REPLAY_SAMPLE_HZ
+                del replay_buf[:-int(REPLAY_S * replay_hz)]
+                next_replay_t[0] += 1.0 / replay_hz
 
             if state_rec is not None and t >= state_rec["next_t"] - 1e-9:
                 state_rec["t"].append(t)
@@ -2115,13 +2259,13 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                 # hardware): grey when idle, amber charging, red when firing
                 frac = cn["charge"] / CORNER_ARM_S
                 if cn["phase"] is not None:
-                    model.geom_rgba[cn["gid"]] = (0.95, 0.15, 0.1, 1.0)
+                    model.geom_rgba[cn["vgid"]] = (0.95, 0.15, 0.1, 1.0)
                 elif frac > 0.05:
-                    model.geom_rgba[cn["gid"]] = (0.75 + 0.2 * frac,
-                                                  0.75 - 0.45 * frac,
-                                                  0.78 - 0.6 * frac, 1.0)
+                    model.geom_rgba[cn["vgid"]] = (0.75 + 0.2 * frac,
+                                                   0.75 - 0.45 * frac,
+                                                   0.78 - 0.6 * frac, 1.0)
                 else:
-                    model.geom_rgba[cn["gid"]] = (0.75, 0.75, 0.78, 1.0)
+                    model.geom_rgba[cn["vgid"]] = (0.75, 0.75, 0.78, 1.0)
 
             # SOUND TAPE: ball impulses sampled at 25 Hz, classified by what
             # the ball touched since the last poll. Consumed after the match

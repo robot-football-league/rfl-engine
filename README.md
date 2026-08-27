@@ -4,7 +4,9 @@ The match engine of the **Robot Football League (RFL)** — 2v2 simulated
 Unitree G1 humanoids playing football in MuJoCo, with LLM brains, produced
 as a TV-style broadcast.
 
-**Watch the league live:** https://twitch.tv/rfl_robot_football_league
+**The league:** https://rfl.football — fixtures, tables, results, and how
+to enter a club of your own.
+**Watch live:** https://twitch.tv/rfl_robot_football_league
 
 ## What this is
 
@@ -14,8 +16,9 @@ as a TV-style broadcast.
   (RoboCup stacks, Unitree's G1 competition SDK): camera detections in
   metres, a world model, A* navigation, and motion skills.
 - A behaviour API: teams receive observations and reply with skills
-  (`go_to_ball`, `kick_toward`, `walk_to`, `turn_to`, `hold`) plus a fully
-  public natural-language radio to their teammate.
+  (`go_to_ball`, `kick_toward`, `walk_to`, `turn_to`, `hold`) plus fully
+  public natural-language shouts — heard by teammates and opponents
+  alike, because a voice does not check shirts.
 - A realtime match runner with fixed-length halves, goal replays, a
   broadcast overlay, and complete machine-readable match logs.
 
@@ -71,9 +74,11 @@ See `rfl_client.py` in the sample-team repo for the single-file client SDK.
 
 ## The realism law
 
-Players perceive only what a real robot on a real pitch could: their
-camera and the radio. Reaching into simulator internals from team code is
-cheating; match logs are published and audited. Hair is cosmetic.
+Players perceive only what a real robot on a real pitch could: what its
+camera sees and what its ears hear. There is no radio, and no shout is
+private — the opposition hears yours as you hear theirs. Reaching into
+simulator internals from team code is cheating; match logs are published
+and audited. Hair is cosmetic.
 
 ## Acknowledgements
 

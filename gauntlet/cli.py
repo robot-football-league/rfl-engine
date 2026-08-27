@@ -97,11 +97,12 @@ def main(argv=None):
     lg.add_argument("--league", default="league.yaml")
     lg.add_argument("--no-audio", action="store_true")
 
-    bc = sub.add_parser("broadcast", help="Twitch: cards, program, stream")
+    bc = sub.add_parser("broadcast",
+                        help="Twitch (+YouTube): cards, program, stream")
     bc.add_argument("action", choices=["auth", "status", "preflight",
-                                       "prepare", "build",
+                                       "testfire", "prepare", "build",
                                        "rehearse", "live", "schedule-week", "panels",
-                                       "bio"])
+                                       "bio", "youtube-auth", "youtube-auth-browser"])
     bc.add_argument("--league", default="league.yaml")
     bc.add_argument("--no-verify", action="store_true",
                     help="status: skip the live Twitch auth check")
@@ -203,6 +204,48 @@ def main(argv=None):
                 alert.alert("preflight FAILED — next slot will not air",
                             "; ".join(problems), severity="error")
                 _sys.exit(1)
+            # The slot is fine, but this machine is not running what we
+            # think it is. severity="warn" tells somebody without setting
+            # `unresolved`, so `status` does not shout about a healthy
+            # channel and nobody is tempted to take a match off air for it.
+            drift = [p for p in problems if p.startswith("code drift")
+                     and "unverified" not in p]
+            if drift:
+                alert.alert("box code drift — the slot will air, but not on "
+                            "the code that was last deployed",
+                            "; ".join(drift), severity="warn")
+            # Same shape, same reasoning: tell somebody the simulcast is
+            # broken without setting `unresolved`, because a YouTube fault
+            # is never a reason to take a match off Twitch. Silence here is
+            # how a second platform quietly stops working for a month.
+            from .broadcast import STATIC_MODE_NOTE
+            yt = [p for p in problems if p.startswith("youtube:")
+                  and p != STATIC_MODE_NOTE]
+            if yt:
+                alert.alert("youtube simulcast degraded — the slot will air "
+                            "on Twitch, but may not reach YouTube",
+                            "; ".join(yt), severity="warn")
+        elif args.action == "testfire":
+            import sys as _sys
+
+            from . import alert
+            from .broadcast import testfire
+            ok, problems, stake = testfire(args.league)
+            if not ok:
+                alert.alert(f"TEST FIRE FAILED — {stake or 'the next slot'} "
+                            "WILL NOT AIR",
+                            "; ".join(problems), severity="error")
+                _sys.exit(1)
+            # Only once Twitch is healthy. If the slot is dead anyway the
+            # simulcast is the least of it, and two alerts for one outage
+            # is how a phone gets ignored.
+            from .broadcast import STATIC_MODE_NOTE
+            yt = [p for p in problems if p.startswith("youtube:")
+                  and p != STATIC_MODE_NOTE]
+            if yt:
+                alert.alert(f"youtube simulcast will not go out — "
+                            f"{stake or 'the next slot'} still airs on Twitch",
+                            "; ".join(yt), severity="warn")
         elif args.action == "prepare":
             from .league import play_next
             play_next(args.league, audio=True)
@@ -218,6 +261,12 @@ def main(argv=None):
         elif args.action == "schedule-week":
             from .broadcast import schedule_week
             schedule_week(args.league)
+        elif args.action == "youtube-auth-browser":
+            from .youtube_api import browser_auth
+            browser_auth()
+        elif args.action == "youtube-auth":
+            from .youtube_api import device_auth
+            device_auth()
         elif args.action == "bio":
             from .broadcast import set_bio
             set_bio(args.league, text=args.text)

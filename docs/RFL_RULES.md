@@ -93,7 +93,11 @@ remain supported as levels arrive.
                        fallen, blocked
     obs["you"]         id, shirt number, team, attack_goal_xy, defend_goal_xy
     obs["score"], obs["time_remaining_s"], obs["decision_interval_s"]
-    obs["teammate_says"], obs["last_skill"]
+    obs["teammate_says"]   your teammate's latest shout
+    obs["opponent_says"]   the latest shout you overheard from the
+                           opposition — shouts carry, and ears do not
+                           check shirts
+    obs["last_skill"]
     obs["_frames"]     the two raw panoramic images as well, if you would
                        rather run your own vision
 
@@ -107,20 +111,27 @@ Skills run closed-loop at control rate with their own steering and A* path
 planning. Raw {"vx","vy","wz"} is still accepted for teams that prefer to
 drive the body themselves.
 
-### Player radio - fully public
+### Player shouts - heard by the whole pitch
 Add "say" to any reply: ONE short sentence of plain, human-readable language
-to your teammate (<=120 chars), delivered on their next decision. League rule:
-the channel is natural language only. Every message is written to
+(<=120 chars), shouted out loud. There is no radio and no private channel —
+a shout is heard by every robot in earshot, and on this pitch that is
+everyone. Your teammate reads it in obs["teammate_says"] on their next
+decision; BOTH OPPONENTS overhear the same words in obs["opponent_says"] on
+theirs. Call your runs and pay the price a human pays: the defender heard
+you too. League rule: natural language only. Every shout is written to
 comms.jsonl AND burned into the broadcast video, so spectators always see
-everything the teams say to each other. Nothing on this channel is hidden.
+everything said on the pitch. Nothing shouted is hidden.
 
 ## The realism law
 
-Players perceive ONLY what a real robot on a real pitch could: their camera
-and the coach radio. Managers see the stadium data feed (positions of
-everything) but can only influence play through a rationed text radio.
-Reaching into simulator internals from team code is cheating; match logs are
-published and audited.
+Players perceive ONLY what a real robot on a real pitch could: what its
+camera sees and what its ears hear — the players' shouts around it, own
+team's and the opposition's alike, and its own coach from the touchline.
+No radio link, no telemetry, no data a human player would not have.
+Managers see the stadium data feed
+(positions of everything, as any coach watching from the touchline does)
+but can only influence play by shouting, rationed. Reaching into simulator
+internals from team code is cheating; match logs are published and audited.
 
 ## Player contract (LEGACY camera+velocity mode, obs_mode: camera)
 
@@ -135,7 +146,7 @@ by the bridge) `decide(obs)` receives:
     obs["you"]             {id, team, attack_goal_color, attack_goal_heading}
     obs["self"]            {heading_rad, velocity, fallen, blocked}   # IMU-class only
     obs["score"], obs["time_remaining_s"], obs["decision_interval_s"]
-    obs["manager_says"]    latest radio instruction (may be "")
+    obs["manager_says"]    latest shouted instruction (may be "")
     obs["last_action_result"]  "ok" | "clipped" | "ignored_invalid"
 
 There are NO positions of the ball, teammates, or opponents. Reply:
@@ -150,7 +161,7 @@ Heading 0 faces +x. The ball resets to pitch center after every goal. Walls
 rebound the ball; corners are beveled. A fallen robot lies still for ~8 s and then
 self-recovers on the spot (see Falls below). Three unparseable replies in a row stop your robot.
 
-## Manager contract (data feed + radio)
+## Manager contract (data feed + shouts)
 
 Every ~10 s `decide(obs)` receives the full data feed: ball position and
 velocity, all player positions/headings/fallen flags, the score and clock,
@@ -161,7 +172,7 @@ your own touchline body state, and `seconds_until_shout_allowed`. Reply:
 Shouts are accepted at most once per 20 s; a shout attempted early is
 dropped (and logged). An empty message holds your shout. "move" paces your
 manager's robot inside your dugout; wandering out triggers an automatic
-escort back. A fallen manager keeps its radio.
+escort back. A fallen manager can still shout.
 
 ## Match day
 
@@ -175,7 +186,7 @@ pockets are painted in the teams' colours and are their identities). The
 scorebug clock counts down within the current half, tagged 1H/2H.
 
 The pitch carries full football markings — halfway line, centre circle,
-penalty and goal areas, penalty spots, corner arcs — but they are PAINT.
+penalty and goal areas, penalty spots — but they are PAINT.
 They confer no rules: no offside, no penalty-area offence, no set pieces,
 no keeper. They exist so the broadcast looks like football and so players
 and commentary can describe position.
@@ -237,9 +248,9 @@ falls and recoveries per robot.
 - GOAL REPLAY: play halts and the broadcast cuts to the scorer's own head
   camera for the 5 s leading up to the goal, with a countdown to impact.
   Replay time is not match time.
-- SPEECH BUBBLES: every player message appears in a bubble above that
-  player's head, tracking them as they move, in their team's colour. The
-  radio is public by rule — spectators see every word, and comms.jsonl keeps
+- SPEECH BUBBLES: every shout appears in a bubble above that player's
+  head, tracking them as they move, in their team's colour. Shouts are
+  public by rule — spectators see every word, and comms.jsonl keeps
   the full transcript.
 - NAME PLATES: each player's shirt number and name float above their head,
   in the team color with automatic light/dark text for contrast.
