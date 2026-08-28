@@ -95,9 +95,19 @@ def play_next(league_path="league.yaml", audio=True):
     state_p.write_text(json.dumps(state, indent=2))
     if audio:
         try:                    # commentary first so the mix can embed it
-            from .commentary import synthesize, write_script
+            from .commentary import (build_card_audio, synthesize,
+                                     write_card_scripts, write_script)
             write_script(out, league=league_path)
+            try:                # build-up + wrap-up for the programme cards;
+                                # never let them cost the match commentary
+                write_card_scripts(out, league=league_path)
+            except Exception as e:
+                print(f"  [commentary] card scripts skipped: {e}")
             synthesize(out)
+            try:
+                build_card_audio(out)
+            except Exception as e:
+                print(f"  [cards] audio skipped: {e}")
         except Exception as e:  # no key / no quota: crowd-only broadcast
             print(f"  [commentary] skipped: {e}")
         try:

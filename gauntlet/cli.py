@@ -108,6 +108,12 @@ def main(argv=None):
                     help="status: skip the live Twitch auth check")
     bc.add_argument("--text", default=None, help="bio: override the text")
 
+    ch = sub.add_parser("chat", help="matchday bot in the channel's chat")
+    ch.add_argument("action", choices=["auth", "run", "lines"])
+    ch.add_argument("--league", default="league.yaml")
+    ch.add_argument("--dry-run", action="store_true",
+                    help="run: print lines instead of connecting")
+
     cm = sub.add_parser("commentary", help="LLM script + ElevenLabs voice")
     cm.add_argument("match_dir")
     cm.add_argument("--script-only", action="store_true",
@@ -117,6 +123,12 @@ def main(argv=None):
     cm.add_argument("--team-b", default=None, help="fallback name for team B")
     cm.add_argument("--players-a", default=None, help="comma: name1,name2")
     cm.add_argument("--players-b", default=None, help="comma: name1,name2")
+    cm.add_argument("--cards", action="store_true",
+                    help="ONLY the pre-match build-up and after-match wrap "
+                         "that play over the programme cards (leaves the "
+                         "match commentary untouched)")
+    cm.add_argument("--no-cards", action="store_true",
+                    help="skip the build-up/wrap-up segments")
 
     lt = sub.add_parser("lint", help="scrutineering: check a team dir against league law")
     lt.add_argument("team")
@@ -131,7 +143,7 @@ def main(argv=None):
 
     args = p.parse_args(argv)
 
-    if args.cmd in ("sound", "broadcast", "commentary"):
+    if args.cmd in ("sound", "broadcast", "commentary", "chat"):
         try:                     # these need the RFL station, which is not
             from . import broadcast  # noqa: F401 -- part of the public engine
         except ImportError:
@@ -274,18 +286,36 @@ def main(argv=None):
             from .broadcast import render_panels
             render_panels(args.league)
 
+    if args.cmd == "chat":
+        from . import chatbot
+        if args.action == "auth":
+            chatbot.auth()
+        elif args.action == "lines":
+            chatbot.lines(args.league)
+        elif args.action == "run":
+            chatbot.run(args.league, dry_run=args.dry_run)
+
     if args.cmd == "commentary":
-        from .commentary import synthesize, write_script
+        from .commentary import (PRE_LINES, POST_LINES, build_card_audio,
+                                 synthesize, write_card_scripts, write_script)
         tn = pn = None
         if args.team_a or args.team_b:
             tn = {"A": args.team_a or "Team A", "B": args.team_b or "Team B"}
         if args.players_a or args.players_b:
             pn = {"A": (args.players_a or "#1,#2").split(","),
                   "B": (args.players_b or "#1,#2").split(",")}
-        write_script(args.match_dir, model=args.model,
-                     team_names=tn, player_names=pn)
+        if not args.cards:
+            write_script(args.match_dir, model=args.model,
+                         team_names=tn, player_names=pn)
+        if not args.no_cards:
+            write_card_scripts(args.match_dir, model=args.model,
+                               team_names=tn, player_names=pn)
         if not args.script_only:
-            synthesize(args.match_dir)
+            names = ((PRE_LINES, POST_LINES) if args.cards else
+                     ("lines.json", PRE_LINES, POST_LINES))
+            synthesize(args.match_dir, names=names)
+            if not args.no_cards:
+                build_card_audio(args.match_dir)
 
     if args.cmd == "rfl-serve":
         from .rfl_server import serve_match

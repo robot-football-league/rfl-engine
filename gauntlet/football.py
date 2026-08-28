@@ -2279,7 +2279,21 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                 by_ = float(data.qpos[ball_qpos_adr + 1])
                 if dv > EVENT_DV_MPS:
                     kind = None
-                    if "robot" in ev_contact and t - last_ev_t["kick"] > 0.3:
+                    # `last_touch[0] is not None` is not paranoia. A RESTART
+                    # (goal, half time, stuck-ball drop) zeroes the ball and
+                    # clears last_touch, but it does NOT clear ev_contact —
+                    # so a robot touch from BEFORE the restart can still be
+                    # sitting in the set on the next poll, while the jump
+                    # that tripped dv is the restart teleporting the ball.
+                    # That is not a kick and there is nobody to credit it
+                    # to. Crediting it crashed m28 on `int(None)` after a
+                    # 10-0 half made restarts frequent enough to collide
+                    # with a touch inside one 25 Hz window.
+                    # Only the kick branch is gated: a corner ram panel can
+                    # legitimately fire an untouched ball into a wall, and
+                    # those wall/post sounds must still be recorded.
+                    if ("robot" in ev_contact and last_touch[0] is not None
+                            and t - last_ev_t["kick"] > 0.3):
                         kind = "kick"
                     elif "wall" in ev_contact and t - last_ev_t["wall"] > 0.4:
                         kind = ("post" if any(math.hypot(bx_ - px, by_ - py) < 0.35

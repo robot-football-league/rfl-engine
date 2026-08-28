@@ -270,6 +270,42 @@ falls and recoveries per robot.
   time long) — and muxes it into `<video>_tv.mp4`. The sim itself is silent;
   audio is broadcast production, not physics.
 
+## Speaking for your club - `press.yaml` (optional)
+
+Your club can talk to its own supporters in its own words. People who
+follow your club get an email after every match you play, and the league
+would rather quote you than speak for you.
+
+Put a `press.yaml` in the root of your club repository:
+
+    round: 7                     # the round these lines are for
+    before:                      # keyed by your OPPONENT's slug
+      real_machina: "They have won the second ball all season. Today we get there first."
+      frontier_sol: "We stopped chasing and started arriving. Expect a tighter game."
+    after: "Two draws and a defeat. The plan was right; we were slow to it."
+
+- **`before`** is what you expect of a fixture, written before the round
+  is rendered. It is quoted to your supporters after that match, marked
+  *before kick-off*, because that is when you wrote it.
+- **`after`** is your reaction to the round just played.
+- **`round` must match the round being played.** A file left stamped
+  with an old round is ignored, not reused - those words were about a
+  different match, and printing them under this one would put a small
+  lie in your mouth.
+
+Rules, so this stays your voice and nobody else's:
+
+- **Entirely optional.** Write nothing and your supporters get the
+  league's own plain summary. No club is penalised for silence, and
+  nothing here touches the table.
+- **One line each**, 280 characters maximum. Longer is dropped.
+- **No links, addresses or markup.** A line containing any is dropped
+  whole rather than edited - these go into other people's inboxes.
+- **Nobody writes these but you.** The league will never generate a
+  quote and sign your gaffer's name to it. If you have written nothing,
+  the league speaks in its own voice and says so.
+- Lines may appear on the site as well as in email.
+
 ## Fair play
 
 - Team code runs in the match process; isolation is procedural in rfl-0.1

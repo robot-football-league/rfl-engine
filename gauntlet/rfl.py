@@ -24,12 +24,44 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 
 ENGINE_VERSION = "rfl-0.1"
+
+
+def _git_out(repo: Path, *args) -> str:
+    try:
+        r = subprocess.run(["git", "-C", str(repo), *args],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def _code_stamp(team_dir) -> dict:
+    """WHICH VERSION OF A CLUB'S CODE ACTUALLY PLAYED THIS MATCH.
+
+    Without this, "what did they change since last week" can only be guessed
+    from commit timestamps, and the guess is wrong whenever a club pushes
+    between a render and its broadcast. The commentary press pack diffs this
+    match's stamp against the club's previous fixture; `dirty` records that
+    the working tree held uncommitted edits, so a stamp can never quietly
+    claim more than it knows.
+    """
+    p = Path(team_dir)
+    if not (p / ".git").exists():
+        return {}
+    sha = _git_out(p, "rev-parse", "HEAD")
+    if not sha:
+        return {}
+    return {"commit": sha,
+            "subject": _git_out(p, "log", "-1", "--format=%s"),
+            "committed_at": _git_out(p, "log", "-1", "--format=%cI"),
+            "dirty": bool(_git_out(p, "status", "--porcelain"))}
 
 
 @dataclass
@@ -141,6 +173,14 @@ def run_rfl_match(team_a_dir, team_b_dir, match_time_s: float = 90.0,
                "away": {"team": b.name, "code": b.code, "goals": result.score[1]},
                "winner": (a.name if result.winner == "A"
                           else b.name if result.winner == "B" else "draw")}
+    # provenance: the exact club code and engine commit that played
+    code = {"home": _code_stamp(a.path), "away": _code_stamp(b.path)}
+    engine_sha = _git_out(Path(__file__).resolve().parent.parent,
+                          "rev-parse", "HEAD")
+    if engine_sha:
+        code["engine_commit"] = engine_sha
+    if any(code.values()):
+        fixture["code"] = code
     print(f"FULL TIME: {a.code} {result.score[0]} - {result.score[1]} {b.code}"
           f"  ({fixture['winner']})")
     if log_dir:
