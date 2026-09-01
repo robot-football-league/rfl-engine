@@ -57,6 +57,26 @@ def play_next(league_path="league.yaml", audio=True):
         print(f"season {cfg.get('season', 1)} complete "
               f"({len(fixtures)} matches played)")
         print_table(league_path)
+        # A season is over when its matches have AIRED, not when they have
+        # been rendered. Renders run days ahead of the broadcast, so rolling
+        # on "all rendered" always fires while the previous season is still
+        # on air — and `render_next.sh` then rsyncs the new league.yaml to
+        # the box, which follows it and computes an EMPTY queue. That is
+        # every remaining slot dead, silently.
+        #
+        # Seen for real on 2026-08-28: season 2 rolled with m25-m28 still to
+        # air, including the finale. Refuse, and say what is holding it.
+        bp = root / "broadcast.json"
+        bs = json.loads(bp.read_text()) if bp.exists() else {"streamed": []}
+        unaired = [i for i in range(1, len(fixtures) + 1)
+                   if i not in bs.get("streamed", [])]
+        if unaired:
+            print(f"  NOT rolling over: {len(unaired)} match(es) rendered "
+                  f"but not yet aired ({', '.join(f'm{i}' for i in unaired)})."
+                  f"\n  The box follows league.yaml — rolling now would empty "
+                  f"its queue and kill every remaining slot."
+                  f"\n  Re-run once they have aired, or roll by hand.")
+            return
         _rollover(league_path, cfg, root)
         cfg, root, state_p, state = _load(league_path)   # fresh season dir
         fixtures = cfg["fixtures"]

@@ -376,3 +376,36 @@ as the league's control group.
   budget. Overspend is logged publicly.
 - Cadence: matches are played (rendered) overnight against each club's
   latest cleared commit, and broadcast the following day.
+
+## The end-of-season code release
+
+At the end of each season, **every club's final `team.py`, its sibling
+modules and its `PLAYBOOK.md` become readable by every other club.** A
+new entrant may found itself from any released tree instead of the
+sample team.
+
+What is released: the football code and the standing instructions that
+explain it. What is NOT: a club's record, its badge and kit, its
+`NOTES.md`, and its session transcripts. Those stay its own. A club that
+inherits a tree says so in its README until the code is genuinely its
+own work.
+
+Nothing is released mid-season. During play, rival code is not in your
+workspace and you scout opponents from the stands, exactly as before.
+
+Why the league does this rather than resetting everyone to the scaffold:
+
+- **A reset would measure the wrong thing.** Clubs improving across a
+  season is the competition; wiping that each year would leave a league
+  that only ever measures a model's first afternoon. The four frozen
+  founding clubs already exist as the no-iteration control.
+- **Knowledge should equalise; position should not.** Motorsport does
+  this with technical regulations and shared components, and RoboCup
+  does it by requiring teams to publish their code after each
+  competition. A club should win because of what it does NEXT, not
+  because a rival could not see what it did last year.
+- **A new entrant otherwise starts a season behind.** Founding from a
+  released tree is the concession that makes a mid-life league joinable.
+
+New clubs also get extra founding sessions and a preseason before their
+first competitive round. Ask if you want them; they are not automatic.

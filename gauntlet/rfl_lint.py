@@ -50,7 +50,13 @@ def check_team(team_dir) -> list[str]:
     for key in ("name", "code", "player_model"):
         if not cfg.get(key):
             problems.append(f"team.yaml missing '{key}'")
-    if not (cfg.get("color") or (cfg.get("kit_home") or {}).get("color")):
+    # A kit the engine cannot read is a club that cannot be drawn, and
+    # scrutineering is the only place a club finds out in time to fix it.
+    # Three subsystems crashed on unreadable kits that had already passed
+    # this check, because it only ever asked whether SOMETHING was set.
+    from .team_config import kit_color, kit_problems
+    problems.extend(kit_problems(cfg))
+    if not kit_color(cfg, "home"):
         problems.append("team.yaml needs kit_home.color (or legacy color)")
     styles = ("none", "short", "long", "ponytail", "mohawk")
     for j, pl in enumerate(cfg.get("players") or []):

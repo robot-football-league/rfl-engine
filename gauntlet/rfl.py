@@ -92,9 +92,14 @@ def load_team(path: str | Path) -> Team:
     spec.loader.exec_module(module)
     if not hasattr(module, "build_team"):
         raise ValueError(f"{path}/team.py must define build_team(ctx)")
-    home = cfg.get("kit_home") or {}
-    away = cfg.get("kit_away") or {}
-    color = home.get("color") or cfg.get("color", [0.5, 0.5, 0.5])
+    # One reader for every shape a club may have written; see
+    # gauntlet/team_config.py for why this is not inlined anywhere.
+    from .team_config import kit_color
+    home_c = kit_color(cfg, "home")
+    away_c = kit_color(cfg, "away")
+    home = {"color": home_c}
+    away = {"color": away_c}
+    color = home_c
     if len(color) == 3:
         color = [*color, 1.0]
     team_kit_away = None

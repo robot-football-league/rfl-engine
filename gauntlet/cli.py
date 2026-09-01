@@ -114,6 +114,17 @@ def main(argv=None):
     ch.add_argument("--dry-run", action="store_true",
                     help="run: print lines instead of connecting")
 
+    cr = sub.add_parser("comments",
+                        help="relay every platform's comments to Discord")
+    cr.add_argument("action", choices=["run", "test"])
+    cr.add_argument("--dry-run", action="store_true",
+                    help="run: read everything, print instead of posting")
+    cr.add_argument("--once", action="store_true",
+                    help="run: one pass of every leg, then exit")
+    cr.add_argument("--backfill", action="store_true",
+                    help="run: relay existing YouTube comments too, instead "
+                         "of seeding them silently on first run")
+
     cm = sub.add_parser("commentary", help="LLM script + ElevenLabs voice")
     cm.add_argument("match_dir")
     cm.add_argument("--script-only", action="store_true",
@@ -143,7 +154,7 @@ def main(argv=None):
 
     args = p.parse_args(argv)
 
-    if args.cmd in ("sound", "broadcast", "commentary", "chat"):
+    if args.cmd in ("sound", "broadcast", "commentary", "chat", "comments"):
         try:                     # these need the RFL station, which is not
             from . import broadcast  # noqa: F401 -- part of the public engine
         except ImportError:
@@ -294,6 +305,14 @@ def main(argv=None):
             chatbot.lines(args.league)
         elif args.action == "run":
             chatbot.run(args.league, dry_run=args.dry_run)
+
+    if args.cmd == "comments":
+        from . import comment_relay
+        if args.action == "test":
+            comment_relay.test()
+        elif args.action == "run":
+            comment_relay.run(dry_run=args.dry_run, once=args.once,
+                              backfill=args.backfill)
 
     if args.cmd == "commentary":
         from .commentary import (PRE_LINES, POST_LINES, build_card_audio,
