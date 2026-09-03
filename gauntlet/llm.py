@@ -84,8 +84,8 @@ def _extract_json(text: str, required=frozenset(("vx", "vy", "wz"))):
 #
 # This matters more than tidiness: the season purse meters against these
 # numbers, so an under-count does not just misreport spend, it lets a club
-# keep buying turns after its budget is gone. The station believed it had
-# spent $3.81 while the dashboard said $9.00.
+# keep buying turns after its budget is gone. Before this was measured the
+# station's own ledger read well under half what the dashboard did.
 #
 # Re-measure with scripts/calibrate_aiml_prices.py whenever the roster or
 # the aggregator's pricing changes; a markup is a business decision and
@@ -277,9 +277,9 @@ class LLMAgent:
                 # and it bills for what it generated whether or not we ever
                 # receive it. Re-sending the same prompt therefore buys a
                 # second full-price generation and, if it also runs long, a
-                # third. On 2026-09-02 that spent $5.17 -- 54% of the day's
-                # entire AIMLAPI bill -- re-sending two prompts, one four
-                # times and one three, and it emptied the daily limit before
+                # third. On 2026-09-02 that went on re-sending two prompts,
+                # one four times and one three; it accounted for more than
+                # half of that day's spend and emptied the daily limit before
                 # four of the six clubs had made a single call.
                 #
                 # So a timeout is returned, never retried. This is deliberately
@@ -669,8 +669,8 @@ class LLMAgent:
         max_tokens = getattr(self, "max_output", None) or 4096
         # Cache the system prefix, read-billed at ~0.1x. _call_anthropic has
         # done this all along; this path did not, so every retry re-bought the
-        # whole ~12,850-token prefix at full price. Input was $2.33 of one
-        # $9.51 session on 2026-09-02 for that reason.
+        # whole ~12,850-token prefix at full price — roughly a quarter of one
+        # 2026-09-02 session's total cost went on re-buying it.
         if "cache_control" not in self._dropped_params:
             system = [{"type": "text", "text": self.system_prompt,
                        "cache_control": {"type": "ephemeral"}}]

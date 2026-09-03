@@ -78,12 +78,12 @@ def scrub_paths(text: str) -> str:
 
 # A single gaffer reply's output ceiling, thinking tokens INCLUDED — they
 # bill as output. This was 20_000 until 2026-09-02, when one AFC Fable
-# session cost $9.51 of a $10 daily limit: six calls returned 12k-20k output
-# tokens at ~$1.30 each. Measured against what a gaffer actually says, that
-# ceiling bought nothing — the largest legitimate reply in the billing export
-# was 1,492 output tokens, and the thinking budget is 2,048, so ~3.5k is the
-# real worst case. 8_000 leaves room for a long file write while capping one
-# call near $0.52 instead of $1.30.
+# session burned through most of a day's spend limit on six calls that each
+# returned 12k-20k output tokens. Measured against what a gaffer actually
+# says, that ceiling bought nothing — the largest legitimate reply in the
+# billing export was 1,492 output tokens, and the thinking budget is 2,048,
+# so ~3.5k is the real worst case. 8_000 leaves room for a long file write
+# while cutting the worst case a single call can cost by about 60%.
 #
 # The ceiling is also a LATENCY control, which is the half that actually bit:
 # a 20k-token generation can outrun REQUEST_TIMEOUT_S, and a timed-out
@@ -158,7 +158,7 @@ class GafferSession:
         # adds to self.spent `if c`, and estimate_cost returns None for a
         # model with no PRICES row — so the session would run to MAX_TURNS
         # believing it had spent nothing. Refuse instead. This is the guard
-        # that keeps a $50 season from becoming an unbounded one.
+        # that keeps a capped season from becoming an unbounded one.
         if estimate_cost(model_spec, 1_000_000, 1_000_000, 0, 0) is None:
             raise ValueError(
                 f"no PRICES row for {model_spec!r} — spend could not be "
@@ -213,8 +213,8 @@ class GafferSession:
             # instead of preparing. Its own friendly was sitting in
             # data/seasons/s0/ the whole time, which is where DeepSeek Rovers
             # found the digest that told it its player model was too slow.
-            # Two sessions and $4.91 of one club's purse went on a sentence
-            # that never said where to look.
+            # Two full sessions of one club's purse went on a sentence that
+            # never said where to look.
             # Count the matches in each season and note when they were last
             # written. Recency has to come from the DATA: season numbers are
             # not in date order (the preseason is s0 and it ran after s2), so
@@ -557,10 +557,10 @@ class GafferSession:
                 self.timed_out = True
                 break
             # A HARD cap, not a line the next turn steps over. Checking
-            # `spent >= budget` between turns lets a turn that starts at
-            # $2.49 of $2.50 spend another $1.30 and finish at $3.79 —
-            # AFC Fable's night 3 overshot by 6.8c that way, and the same
-            # check is what a season purse is enforced with.
+            # `spent >= budget` between turns lets a turn that starts a
+            # penny under the cap spend a whole call's worth and finish half
+            # as much again over it — AFC Fable's night 3 overshot that way,
+            # and the same check is what a season purse is enforced with.
             #
             # So size the REQUEST to what is left: the reply cannot cost more
             # than its output ceiling allows, so lower the ceiling until the
