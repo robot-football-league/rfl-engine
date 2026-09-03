@@ -2671,7 +2671,8 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
     result.score = score
     result.winner = ("draw" if score[0] == score[1]
                      else ("A" if score[0] > score[1] else "B"))
-    # cost roll-up across players + managers (API usage fields; $0 for local)
+    # cost roll-up across players + managers (API usage fields; a local
+    # model bills nothing)
     from .llm import estimate_cost
     def billable(obj, depth=0):
         """Every metered brain reachable from a team's player object.

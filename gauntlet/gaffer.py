@@ -784,10 +784,10 @@ def run_night(team_dir, model_spec, night, budget_usd=5.0,
               club=None, season=None, wall_cap_s=None):
     """Run one session. With a ledger, the spend is recorded even on a crash.
 
-    The ledger write is in a `finally` on purpose: a session that burned two
-    dollars and then threw has still burned two dollars, and a purse that
-    forgets those is not a cap. `_finish` is skipped on that path — the
-    transcript is lost, the money is not.
+    The ledger write is in a `finally` on purpose: a session that spent its
+    budget and then threw has still spent it, and a purse that forgets that
+    is not a cap. `_finish` is skipped on that path — the transcript is
+    lost, the spend is not.
     """
     sess = GafferSession(team_dir, model_spec, night, budget_usd,
                          data_dir=data_dir, ref_dir=ref_dir,
