@@ -23,7 +23,68 @@ told while it can still act.
 
 from __future__ import annotations
 
+import functools
+from pathlib import Path
+
 DEFAULT = [0.5, 0.5, 0.5]
+
+# Vendor slug -> the company an audience would name.
+_MAKER = {"anthropic": "Anthropic", "openai": "OpenAI", "google": "Google",
+          "meta": "Meta", "zhipu": "Zhipu", "deepseek": "DeepSeek",
+          "moonshot": "Moonshot", "alibaba": "Alibaba", "xai": "xAI"}
+
+
+@functools.lru_cache(maxsize=1)
+def _roster() -> dict:
+    """The league's own record of which clubs are AI-managed."""
+    import yaml
+    try:
+        spec = yaml.safe_load(
+            (Path(__file__).resolve().parent.parent
+             / "config/gaffers.yaml").read_text()) or {}
+    except OSError:
+        return {}
+    return {k: (v or {}).get("model") or ""
+            for k, v in (spec.get("clubs") or {}).items()}
+
+
+def gaffer_of(slug: str, cfg: dict | None = None) -> dict | None:
+    """Who manages this club, or None if genuinely nobody does.
+
+    A club is AI-managed because the LEAGUE put it in config/gaffers.yaml,
+    not because it happened to write a `gaffer:` block in its own team.yaml.
+    GLM FC named its model in a comment at the top of the file and never
+    wrote the field, so every surface that keyed off the block alone
+    described it as a frozen founding club — on the Twitch teams panel and
+    on rfl.football, while it was actively rewriting its own code between
+    rounds.
+
+    The club's own words win when it wrote them; the roster fills the gap.
+    Absence of BOTH is what "founding club" means.
+    """
+    spec = _roster().get(slug) or ""
+    canon, maker = None, None
+    if spec and "REPLACE" not in spec:
+        tail = spec.split(":")[-1]
+        vendor, _, model = tail.partition("/")
+        canon = model or tail
+        maker = _MAKER.get(vendor.lower(), vendor.title())
+
+    own = (cfg or {}).get("gaffer")
+    if isinstance(own, dict) and own.get("model"):
+        # The club's own words are what it calls itself, and they are what
+        # rfl.football shows. `model_id` is the league's canonical id for the
+        # same model, for surfaces that need every club to read the same way:
+        # clubs wrote "Claude Fable 5 (claude-fable-5)", "Codex (GPT-5)" and
+        # "muse-spark-1.2" for the same kind of field, so a banner built from
+        # their free text lists three names in three styles.
+        out = dict(own)
+        out.setdefault("maker", maker)
+        out["model_id"] = canon or str(own.get("model"))
+        return out
+    if canon is None:
+        return None
+    return {"model": canon, "model_id": canon, "maker": maker}
 
 
 def _rgb(value):

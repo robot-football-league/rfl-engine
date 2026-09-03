@@ -57,6 +57,44 @@ WINDOW_HEADLINE = 220      # chars kept from each older entry
 # eight productive turns and committed nothing but its transcript.
 MAX_MODEL_ERRORS = 3
 
+# Session transcripts are PUBLISHED. A tool error carries the exception's
+# message verbatim, and a FileNotFoundError's message is an absolute path on
+# the machine the league runs on — so `/Users/<someone>/...` went out in three
+# published transcripts (fable night_005, sol night_005, glm night_000) before
+# anyone noticed on 2026-09-02. It is not a credential, but it is the station's
+# private filesystem layout and it belongs to nobody's football club.
+#
+# Scrubbed where it ENTERS the log, so a gaffer never sees the path and cannot
+# quote it back — in glm's transcript the club had echoed the path into its own
+# reasoning, which no amount of scrubbing the harness's side alone would catch.
+# Applied again over the finished transcript as a backstop.
+_HOME_PATH = re.compile(r"/(?:Users|home)/[^/\s'\"<>|]+/")
+
+
+def scrub_paths(text: str) -> str:
+    """Replace absolute home-directory paths with an elision marker."""
+    return _HOME_PATH.sub(".../", text)
+
+
+# A single gaffer reply's output ceiling, thinking tokens INCLUDED — they
+# bill as output. This was 20_000 until 2026-09-02, when one AFC Fable
+# session cost $9.51 of a $10 daily limit: six calls returned 12k-20k output
+# tokens at ~$1.30 each. Measured against what a gaffer actually says, that
+# ceiling bought nothing — the largest legitimate reply in the billing export
+# was 1,492 output tokens, and the thinking budget is 2,048, so ~3.5k is the
+# real worst case. 8_000 leaves room for a long file write while capping one
+# call near $0.52 instead of $1.30.
+#
+# The ceiling is also a LATENCY control, which is the half that actually bit:
+# a 20k-token generation can outrun REQUEST_TIMEOUT_S, and a timed-out
+# generation is billed in full whether or not we ever see it.
+GAFFER_MAX_OUTPUT = 8_000
+
+# The smallest reply worth paying for. A thinking call needs max_tokens above
+# the thinking budget by at least 1024 (see LLMAgent._call_aiml_anthropic), so
+# under this there is no valid request to make and the session should stop.
+MIN_TURN_OUTPUT = 3_072
+
 # A session must also end in bounded TIME, not just bounded money and
 # turns. GLM's founding night took 3h38m of wall clock — not hung, but
 # sitting out repeated `retry_after` backoffs on a degraded endpoint. That
@@ -115,7 +153,7 @@ def _git(team_dir, *args, check=True):
 class GafferSession:
     def __init__(self, team_dir, model_spec, night, budget_usd=5.0,
                  data_dir=None, ref_dir=None, budget_note=None,
-                 wall_cap_s=None):
+                 wall_cap_s=None, season=None):
         # An unpriced model makes the budget cap silently dead: run() only
         # adds to self.spent `if c`, and estimate_cost returns None for a
         # model with no PRICES row — so the session would run to MAX_TURNS
@@ -139,7 +177,10 @@ class GafferSession:
         self.reasoning_tokens = 0
         self.reports = []             # issues this club filed against the league
         self.fabricated_chars = 0     # league-voice text the model invented
-        self.season = None            # set by the caller; stamped into reports
+        # Set HERE, not by the caller afterwards: _system_prompt runs during
+        # __init__ and has to name the current season, and season numbers are
+        # not chronological -- the preseason is s0 and it comes AFTER s2.
+        self.season = season          # stamped into reports
         self.turn = 0                 # for the turns-left line
         self.started_at = time.time()
         self.wall_cap = float(wall_cap_s or SESSION_WALL_CAP_S)
@@ -149,7 +190,7 @@ class GafferSession:
         from .llm import LLMAgent
         self.adapter = LLMAgent(provider, model, prompt="football_v2")
         self.adapter.system_prompt = self._system_prompt(model_spec)
-        self.adapter.max_output = 20_000
+        self.adapter.max_output = GAFFER_MAX_OUTPUT
         self.adapter.effort = "high"
         # Ask the provider for its reasoning where one will give it (see
         # LLMAgent._call_aiml). A player brain never sets this: thinking
@@ -164,9 +205,70 @@ class GafferSession:
         founded = (self.club / "team.yaml").exists() and \
             "REPLACE" not in (self.club / "team.yaml").read_text()
         if founded:
-            brief = (f"Game-day results through night {self.night} are in "
-                     "data/. Review what happened, scout the table, improve "
-                     "your club, and commit.")
+            # Name the DIRECTORIES that exist, not a night number. The old
+            # wording -- "results through night N are in data/" -- described
+            # the data by a counter no directory is named after, and AFC
+            # Fable twice reasoned from the league's season number to
+            # data/seasons/s3/, found nothing, and filed a blocker report
+            # instead of preparing. Its own friendly was sitting in
+            # data/seasons/s0/ the whole time, which is where DeepSeek Rovers
+            # found the digest that told it its player model was too slow.
+            # Two sessions and $4.91 of one club's purse went on a sentence
+            # that never said where to look.
+            # Count the matches in each season and note when they were last
+            # written. Recency has to come from the DATA: season numbers are
+            # not in date order (the preseason is s0 and it ran after s2), so
+            # neither the name nor the sort position tells you which football
+            # happened most recently.
+            seasons, counts, newest = [], {}, {}
+            if self.data and (self.data / "seasons").is_dir():
+                for d in sorted((self.data / "seasons").iterdir()):
+                    if not d.is_dir():
+                        continue
+                    seasons.append(d.name)
+                    ms = [m for m in d.glob("m*") if m.is_dir()]
+                    counts[d.name] = len(ms)
+                    newest[d.name] = max((m.stat().st_mtime for m in ms),
+                                         default=0)
+            # NEVER infer "most recent" from the sort order. Season numbers
+            # are not chronological: the preseason is s0 and it runs AFTER
+            # s2, so alphabetical order points a club at last season.
+            cur = f"s{self.season}" if self.season is not None else None
+            listing = ", ".join(f"{n} ({counts[n]} match"
+                                f"{'' if counts[n] == 1 else 'es'})"
+                                for n in seasons)
+            digest = ("Each match directory has a digest.json beside the raw "
+                      "match.json: read the digest first, it is the "
+                      "counted-up version.")
+            # A season that has just rolled over has an EMPTY directory. On
+            # 2026-09-02 season 3 opened three minutes before AFC Fable sat
+            # down; it was pointed at data/seasons/s3/, found nothing and
+            # reported the archive missing for the third session running.
+            # Every club would have hit this at the first round boundary.
+            latest = max((n for n in seasons if counts[n]),
+                         key=lambda n: newest[n], default=None)
+            if cur in seasons and counts.get(cur):
+                where = (f"data/seasons/ holds {listing}. The league is in "
+                         f"season {self.season} right now, so your most recent "
+                         f"matches are in data/seasons/{cur}/. Season numbers "
+                         f"are not in date order. {digest}")
+            elif cur in seasons and latest:
+                where = (f"data/seasons/ holds {listing}. Season "
+                         f"{self.season} has only just started and has no "
+                         f"matches yet — that is expected, not a fault, so "
+                         f"do not report it as missing data. The most "
+                         f"recently played football is in "
+                         f"data/seasons/{latest}/; review that. Season "
+                         f"numbers are not in date order. {digest}")
+            elif seasons:
+                where = (f"data/seasons/ holds {listing}, one directory per "
+                         f"season. {digest}")
+            else:
+                where = ("data/seasons/ is where match results live, one "
+                         "directory per season.")
+            brief = (f"Game-day results are in data/. {where} Review what "
+                     "happened, scout the table, improve your club, and "
+                     "commit.")
             state = "# Your club\n\n" + (self.club / "team.yaml").read_text()
         else:
             brief = (
@@ -454,10 +556,30 @@ class GafferSession:
                            f"wall-clock cap after {turn} turn(s)")
                 self.timed_out = True
                 break
-            if self.spent >= self.budget:
+            # A HARD cap, not a line the next turn steps over. Checking
+            # `spent >= budget` between turns lets a turn that starts at
+            # $2.49 of $2.50 spend another $1.30 and finish at $3.79 —
+            # AFC Fable's night 3 overshot by 6.8c that way, and the same
+            # check is what a season purse is enforced with.
+            #
+            # So size the REQUEST to what is left: the reply cannot cost more
+            # than its output ceiling allows, so lower the ceiling until the
+            # worst case fits the remaining budget. Below the floor a
+            # thinking call cannot even be formed (the budget must be at
+            # least 1024 and strictly under max_tokens), so the session ends
+            # there rather than issuing a call it cannot pay for.
+            remaining = self.budget - self.spent
+            po = estimate_cost(self.model_spec, 0, 1_000_000, 0, 0) or 0.0
+            pi = estimate_cost(self.model_spec, 1_000_000, 0, 0, 0) or 0.0
+            est_in_tok = (len(self.adapter.system_prompt or "")
+                          + len(self._render_transcript())) / 4
+            afford = remaining - est_in_tok * pi / 1e6
+            afford_out = int(afford * 1e6 / po) if po > 0 else GAFFER_MAX_OUTPUT
+            if remaining <= 0 or afford_out < MIN_TURN_OUTPUT:
                 self.log.append(("harness", "BUDGET EXHAUSTED — session over"))
                 summary = "session ended at budget cap"
                 break
+            self.adapter.max_output = min(GAFFER_MAX_OUTPUT, afford_out)
             text, usage, err = self.adapter._call_with_retries(
                 self._render_transcript())
             if err:
@@ -554,7 +676,7 @@ class GafferSession:
             try:
                 result = handler(call)
             except Exception as e:
-                result = f"tool error: {type(e).__name__}: {e}"
+                result = scrub_paths(f"tool error: {type(e).__name__}: {e}")
             # Label the result with the call it answers. Without this, a
             # condensed older entry shows the first line of a FILE's contents
             # and nothing about which file — so a gaffer cannot tell it has
@@ -567,8 +689,8 @@ class GafferSession:
                 what += f" {call['path']}"
                 if call.get("offset"):
                     what += f"@{call['offset']}"
-            self.log.append(("harness",
-                             f"[{what}] {result}\n({time.time()-t0:.1f}s)"))
+            self.log.append(("harness", scrub_paths(
+                f"[{what}] {result}\n({time.time()-t0:.1f}s)")))
         return self._finish(summary)
 
     def _finish(self, summary):
@@ -588,7 +710,12 @@ class GafferSession:
                  "harness": "league"}
         for who, text in self.log:
             tr += [f"## {label.get(who, who)}", "", text, ""]
-        (sess / f"night_{self.night:03d}.md").write_text("\n".join(tr))
+        # Backstop. The scrub at the tool boundary is the real fix; this
+        # catches a path that reached the log by any other route — a gaffer
+        # quoting one back, or a future caller appending to self.log without
+        # going through the tool handler.
+        (sess / f"night_{self.night:03d}.md").write_text(
+            scrub_paths("\n".join(tr)))
         if not (self.club / ".git").exists():
             _git(self.club, "init")
         _git(self.club, "add", "-A")
@@ -664,8 +791,8 @@ def run_night(team_dir, model_spec, night, budget_usd=5.0,
     """
     sess = GafferSession(team_dir, model_spec, night, budget_usd,
                          data_dir=data_dir, ref_dir=ref_dir,
-                         budget_note=budget_note, wall_cap_s=wall_cap_s)
-    sess.season = season
+                         budget_note=budget_note, wall_cap_s=wall_cap_s,
+                         season=season)
     try:
         return sess.run()
     finally:

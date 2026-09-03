@@ -68,10 +68,13 @@ FOOTBALL_CAM_W, FOOTBALL_CAM_H = 480, 240
 # BASE_H in absolute pixels; gauntlet.draw2d.Scaled multiplies them up to
 # whatever TV_W x TV_H actually is, so the layout is authored once. Keep
 # BASE 16:9 and TV 16:9 — 4DGSX size their XR screen off the video itself.
-BASE_W, BASE_H = 854, 480
-# the broadcast's own frame — the cards and this render are concatenated with
-# `-c copy`, so they must be the SAME numbers, not two copies of them
-from .broadcast import TV_CRF, TV_FPS, TV_H, TV_W  # noqa: E402
+# The programme cards are concatenated onto this render with `-c copy`, so
+# both halves must be the SAME numbers, not two copies of them — which is
+# why they are imported, from the module that does the scaling. Not from
+# broadcast.py: that is the STATION's Twitch/YouTube layer, deliberately
+# absent from the public engine, and importing it here at module level made
+# `import gauntlet.football` fail outright for anyone who cloned rfl-engine.
+from .draw2d import BASE_H, BASE_W, TV_CRF, TV_FPS, TV_H, TV_W  # noqa: E402
 FOOTBALL_CAM_FOVY = 81.8
 # the frame pair is a MOTION BURST, not a history: the older frame is taken
 # PREFRAME_LEAD_S before the request. It used to be the previous request's
@@ -257,6 +260,140 @@ def _stripe_texture(width: int = 512, height: int = 512) -> Path:
     return out
 
 
+# ADVERTISING BOARDS: visual-only skins on the pitch faces of the perimeter
+# walls. The walls themselves — names, sizes, positions, contype/conaffinity,
+# friction — are untouched: they are the surfaces the ball rebounds off and
+# the audio tape classifies impacts by their names. Each board is a thin box
+# whose local +z is the pitch-facing normal, because that is the one
+# orientation MuJoCo maps a 2d texture onto cleanly (an upright box smears
+# the texture down its vertical faces — measured, not assumed). The face
+# sits BOARD_PROUD in front of the wall skin so the two parallel planes can
+# never z-fight; the ball (r=0.35) visually overlaps 2 mm at contact, which
+# is invisible at broadcast scale. Corner ram panels carry NO boards: their
+# faces are the arming light (rgba mutated at runtime) and painting over a
+# safety indicator would hide it.
+# Palette is deliberately dark with white/violet type: the boards replace
+# the checker the egocams used to see, so they must offer vision models
+# strong gradients WITHOUT large saturated fields anywhere near the ball
+# magenta or either kit color.
+BOARD_H = 0.78            # board face height (wall is 0.9 — a lip stays)
+BOARD_Z0 = 0.05           # grass clearance under the face
+BOARD_T = 0.005           # half thickness of the visual skin
+BOARD_PROUD = 0.002       # how far the face sits in front of the wall skin
+BOARD_URL = "rfl.football"
+BOARD_WORDMARK = "ROBOT FOOTBALL LEAGUE"
+BOARD_VIOLET = (139, 92, 246)          # brand violet (site --primary)
+# the league mark (station-private art). The engine is public and must not
+# depend on it: absent file -> type-only boards, same geometry.
+BOARD_LOGO = "work/brand/rfl-ball-trimmed-1024.png"
+
+
+def _board_font(px: int):
+    """Best available bold sans. The station renders on macOS; the public
+    engine may be anywhere, so try a small ladder and degrade to PIL's
+    bitmap font rather than fail a render over typography."""
+    from PIL import ImageFont
+    for cand in ("/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+                 "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                 "/System/Library/Fonts/Helvetica.ttc"):
+        try:
+            return ImageFont.truetype(cand, px)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _fit_font(draw, text: str, max_w: float, px: int):
+    while px > 8:
+        f = _board_font(px)
+        if draw.textlength(text, font=f) <= max_w:
+            return f
+        px = max(8, int(px * 0.92))
+    return _board_font(8)
+
+
+def _board_texture(design: str, w_m: float) -> Path:
+    """One hoarding face as pixels: an LED-style panel at the EXACT aspect of
+    the geom it skins (a stretched texture reads instantly as fake). Cached
+    like the turf tile; delete the file to regenerate."""
+    from . import paths
+    H = 512
+    W = int(round(H * w_m / BOARD_H / 2)) * 2
+    out = paths.ROOT / "runs" / "assets" / f"board_{design}_{W}.png"
+    if out.exists():
+        return out
+    out.parent.mkdir(parents=True, exist_ok=True)
+    import numpy as _np
+    from PIL import Image as _I
+    from PIL import ImageDraw as _D
+    from PIL import ImageFilter as _F
+
+    # cabinet: near-black violet gradient, faint scanlines + panel seams —
+    # the texture an idle LED board actually has, and cheap ViNT structure
+    top = _np.array([0.075, 0.062, 0.105])
+    bot = _np.array([0.028, 0.022, 0.045])
+    g = _np.linspace(0.0, 1.0, H)[:, None, None]
+    img = (top * (1 - g) + bot * g) * _np.ones((H, W, 3))
+    img[::4] *= 0.93                        # scanlines
+    # cabinet module seams every ~0.5 m
+    img[:, ::max(8, W // max(1, int(w_m / 0.5)))] *= 0.80
+    img[:6] += 0.10                         # top edge catching the floodlight
+    img[-10:] *= 0.75                       # grounded shadow line
+    pim = _I.fromarray((_np.clip(img, 0, 1) * 255).astype("uint8"))
+    d = _D.Draw(pim)
+    vio = BOARD_VIOLET
+    white = (245, 244, 250)
+
+    logo = None
+    lp = paths.ROOT / BOARD_LOGO
+    if lp.exists():
+        logo = _I.open(lp).convert("RGB")
+
+    def paste_logo(cx, cy, s):
+        """The mark is bright-on-black art: its own luminance is the mask,
+        so the square plate vanishes into the dark cabinet."""
+        lg = logo.resize((s, s), _I.LANCZOS)
+        a = lg.convert("L").point(lambda v: min(255, int(v * 1.9)))
+        pim.paste(lg, (int(cx - s / 2), int(cy - s / 2)), a)
+
+    def glow_text(x, y, text, font, fill, anchor="mm"):
+        m = _I.new("L", (W, H), 0)
+        _D.Draw(m).text((x, y), text, font=font, fill=255, anchor=anchor)
+        halo = m.filter(_F.GaussianBlur(H * 0.02))
+        pim.paste(_I.new("RGB", (W, H), vio), (0, 0),
+                  halo.point(lambda v: v // 3))
+        _D.Draw(pim).text((x, y), text, font=font, fill=fill, anchor=anchor)
+
+    if design == "url":
+        f = _fit_font(d, BOARD_URL, W * 0.80, int(H * 0.42))
+        pre = d.textlength("rfl", font=f)
+        full = d.textlength(BOARD_URL, font=f)
+        x0 = (W - full) / 2
+        glow_text(x0, H * 0.52, "rfl", f, vio, anchor="lm")
+        glow_text(x0 + pre, H * 0.52, ".football", f, white, anchor="lm")
+    elif design == "league" and w_m / BOARD_H < 2.0:   # narrow end panel
+        if logo is not None:
+            paste_logo(W * 0.26, H * 0.50, int(H * 0.86))
+            f = _fit_font(d, "RFL", W * 0.42, int(H * 0.50))
+            glow_text(W * 0.70, H * 0.52, "RFL", f, white)
+        else:
+            f = _fit_font(d, "RFL", W * 0.6, int(H * 0.55))
+            glow_text(W * 0.5, H * 0.52, "RFL", f, white)
+    else:                                              # league, full width
+        tx0 = W * 0.06
+        if logo is not None:
+            paste_logo(W * 0.11, H * 0.50, int(H * 0.88))
+            tx0 = W * 0.22
+        f = _fit_font(d, BOARD_WORDMARK, W - tx0 - W * 0.06, int(H * 0.30))
+        glow_text((tx0 + W - W * 0.06) / 2, H * 0.44, BOARD_WORDMARK, f, white)
+        tw = d.textlength(BOARD_WORDMARK, font=f)
+        cx = (tx0 + W - W * 0.06) / 2
+        d.rectangle([cx - tw / 2, H * 0.62, cx - tw / 2 + tw * 0.38, H * 0.62 + H * 0.025],
+                    fill=vio)
+    pim.save(out)
+    return out
+
+
 def _pitch_xml(team_colors=TEAM_RGBA) -> str:
     root = ET.Element("mujoco", {"model": "g1_football_pitch"})
     vis = ET.SubElement(root, "visual")
@@ -279,8 +416,17 @@ def _pitch_xml(team_colors=TEAM_RGBA) -> str:
         # texuniform makes texrepeat world-scaled. One tile is a there-and
         # -back mowing pass (2 stripes), so 0.5 = a 2 m pass = 1 m stripes:
         # 14 across the 14 m pitch, 7 per half.
+        # reflectance 0: the floor is a plane, and MuJoCo mirrors the scene
+        # in any reflective plane. At 0.06 that sheen was invisible against
+        # gray checker walls, but the advertising boards put legible type on
+        # those walls and the pitch echoed it back MIRRORED -- text crawling
+        # across the grass under the near boards, which reads as a rendering
+        # fault rather than a wet pitch. The BOARDS keep their own 0.08 --
+        # that is panel sheen on a near-black face, not a mirror anyone can
+        # read. Visual only: no geom, no collision property and no contact
+        # parameter is touched.
         "name": "pitchgrass", "texture": "pitchgrass",
-        "texuniform": "true", "texrepeat": "0.5 0.5", "reflectance": "0.06"})
+        "texuniform": "true", "texrepeat": "0.5 0.5", "reflectance": "0"})
     _texture_assets(asset)
 
     wb = ET.SubElement(root, "worldbody")
@@ -431,6 +577,88 @@ def _pitch_xml(team_colors=TEAM_RGBA) -> str:
                 "rgba": "0.18 0.18 0.21 1", "contype": "0",
                 "conaffinity": "0"})
             k += 1
+
+    # ADVERTISING BOARDS (see the constants block above _board_texture for
+    # why these are shaped the way they are). Boards cover the wall runs the
+    # bevels leave exposed: five per touchline, one per end-wall segment
+    # between goal mouth and bevel. Designs alternate around the ring.
+    run = PITCH_X - bev                     # touchline boards span |x| < run
+    n_side = 5
+    pw = 2 * run / n_side                   # 2.12 m per touchline panel
+    end_lo, end_hi = GOAL_HALF_W, PITCH_Y - bev
+    ew = end_hi - end_lo                    # 1.2 m per end-wall panel
+    # The OUTWARD face of the south wall. It carries no bevels and runs the
+    # wall's whole length, so it takes wider panels than the touchline.
+    outer_half = PITCH_X + GOAL_DEPTH + 2 * WALL_T
+    n_outer = 7
+    ow = 2 * outer_half / n_outer           # 2.26 m per outer panel
+    for kind, w_m in (("w", pw), ("e", ew), ("o", ow)):
+        for design in ("url", "league"):
+            tex = _board_texture(design, w_m)
+            ET.SubElement(asset, "texture", {
+                "type": "2d", "name": f"tex_board_{design}_{kind}",
+                "file": str(tex), "content_type": "image/png"})
+            ET.SubElement(asset, "material", {
+                "name": f"mat_board_{design}_{kind}",
+                "texture": f"tex_board_{design}_{kind}",
+                "texrepeat": "1 1", "reflectance": "0.08",
+                "emission": "0.25"})        # LED boards are self-lit a little
+
+    def _board_quat(x_axis, z_axis):
+        """Map board local axes -> world: x along the wall in the direction
+        the type reads, y up, z the pitch-facing normal (the 2d-texture
+        projection axis)."""
+        x = np.asarray(x_axis, dtype=float)
+        z = np.asarray(z_axis, dtype=float)
+        R = np.column_stack([x, np.cross(z, x), z])
+        q = np.empty(4)
+        mujoco.mju_mat2Quat(q, R.flatten())
+        return q
+
+    def board(name, cx, cy, half_w, x_axis, z_axis, design, kind):
+        ET.SubElement(wb, "geom", {
+            "name": name, "type": "box",
+            "size": f"{half_w} {BOARD_H / 2} {BOARD_T}",
+            "pos": f"{cx} {cy} {BOARD_Z0 + BOARD_H / 2}",
+            "quat": " ".join(f"{v:.6f}" for v in _board_quat(x_axis, z_axis)),
+            "rgba": "1 1 1 1", "material": f"mat_board_{design}_{kind}",
+            "contype": "0", "conaffinity": "0", "group": "1"})
+
+    designs = ("url", "league")
+    off = BOARD_T - BOARD_PROUD             # face sits proud of the wall skin
+    for i in range(n_side):
+        cx = -run + pw * (i + 0.5)
+        # north wall: read left-to-right from inside the pitch means +x
+        board(f"board_n_{i}", cx, PITCH_Y + off, pw / 2,
+              (1, 0, 0), (0, -1, 0), designs[i % 2], "w")
+        # south wall faces the other way, so the type axis flips — and the
+        # design sequence is offset so no two boards meet corner-to-corner
+        board(f"board_s_{i}", cx, -PITCH_Y - off, pw / 2,
+              (-1, 0, 0), (0, 1, 0), designs[(i + 1) % 2], "w")
+    # THE ONE FACE THE BROADCAST ACTUALLY SEES BESIDES THE FAR TOUCHLINE.
+    # The TV camera sits south of the pitch, so the near wall shows it a
+    # blank back — the grey band across the bottom of every wide shot. Skin
+    # that outward face too. It reads from the same side as the far boards
+    # (camera at -y looking +y, so type still runs +x) and needs no bevel
+    # gap, because the bevels are inside the wall, not outside it.
+    # Robots cannot see these: the wall is opaque, so nothing a club
+    # observes through its cameras changes.
+    oy = PITCH_Y + 2 * WALL_T               # the south wall's outer face
+    for i in range(n_outer):
+        cx = -outer_half + ow * (i + 0.5)
+        board(f"board_out_{i}", cx, -oy - off, ow / 2,
+              (1, 0, 0), (0, -1, 0), designs[i % 2], "o")
+
+    ey = (end_lo + end_hi) / 2
+    for sgn, tag in ((1, "e"), (-1, "w")):
+        # the end walls STRADDLE the goal line (see the wall comment above):
+        # the face the ball hits — and the boards skin — is at PITCH_X - WALL_T
+        gx = sgn * (PITCH_X - WALL_T + off)
+        xa = (0, -sgn, 0)                   # reads correctly from the pitch
+        za = (-sgn, 0, 0)
+        board(f"board_{tag}_top", gx, ey, ew / 2, xa, za, "league", "e")
+        board(f"board_{tag}_bot", gx, -ey, ew / 2, xa, za, "url", "e")
+
     # PITCH MARKINGS — painted lines, scaled from a full-size pitch
     # (105x68 m -> 14x9 m). Purely cosmetic: every one of these is
     # collision-free and carries NO rules meaning. There is still no

@@ -32,6 +32,34 @@ def _team_name(team_dir):
     return yaml.safe_load((Path("teams") / team_dir / "team.yaml").read_text())
 
 
+def double_round_robin(teams):
+    """Home/away reversed in the second half — same shape as _rollover.
+
+    ROUND ORDER MATTERS, and the nested-loop version got it wrong. It
+    produced every correct pairing, but in the order teams[0]-v-everyone,
+    then teams[1]-v-everyone: slice that into rounds of five and "round 1"
+    is one club playing all five matches while four clubs do not play at
+    all. Every one of season 3's 18 rounds was like that. The league slices
+    this list into rounds everywhere it matters — the round-boundary gaffer
+    sessions, rounds_done in league_loop.sh, the standings the audience
+    reads — so the order is not cosmetic.
+
+    Circle method: fix one club, rotate the rest. Each round is then a set
+    of simultaneous pairings using every club exactly once, which is what a
+    round IS. The fixed club alternates home and away so it does not play
+    every one of its first-half matches at home.
+    """
+    n = len(teams)
+    fixed, rot = teams[0], list(teams[1:])
+    single = []
+    for r in range(n - 1):
+        single.append([fixed, rot[0]] if r % 2 == 0 else [rot[0], fixed])
+        for i in range(1, n // 2):
+            single.append([rot[i], rot[-i]])
+        rot = [rot[-1]] + rot[:-1]
+    return single + [[a, h] for h, a in single]
+
+
 def _rollover(league_path, cfg, root):
     """Season N is done: archive its config, start season N+1 as a DOUBLE
     round robin (home/away reversed in the second half of the fixtures)."""
@@ -39,11 +67,9 @@ def _rollover(league_path, cfg, root):
     season = cfg.get("season", 1)
     shutil.copy(league_path, root / "league.yaml")   # archive as played
     teams = cfg["teams"]
-    single = [[teams[i], teams[j]] for i in range(len(teams))
-              for j in range(i + 1, len(teams))]
     cfg2 = dict(cfg)
     cfg2["season"] = season + 1
-    cfg2["fixtures"] = single + [[a, h] for h, a in single]
+    cfg2["fixtures"] = double_round_robin(teams)
     Path(league_path).write_text(yaml.safe_dump(cfg2, sort_keys=False))
     print(f"  [league] season {season} archived -> season {season + 1} "
           f"begins: {len(cfg2['fixtures'])} matches (double round robin)")

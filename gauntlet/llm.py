@@ -43,6 +43,9 @@ DROPPABLE_PARAMS = {
     # The Responses endpoint's reasoning block ({effort, summary}); a model
     # that rejects a summary request gets called without one.
     "reasoning": ("reasoning",),
+    # Prompt-prefix caching. Sent as a block-shaped `system`; an aggregator
+    # that will not take that shape gets the plain string instead.
+    "cache_control": ("cache_control", "cache control"),
 }
 
 
@@ -269,6 +272,27 @@ class LLMAgent:
                 msg = f"{type(e).__name__}: {e}"
                 if self.provider == "mock":
                     return None, None, msg  # local bug: retrying can't fix it
+                # A TIMEOUT IS NOT A FAILED REQUEST. It is this client giving
+                # up; the server may already have generated the whole reply,
+                # and it bills for what it generated whether or not we ever
+                # receive it. Re-sending the same prompt therefore buys a
+                # second full-price generation and, if it also runs long, a
+                # third. On 2026-09-02 that spent $5.17 -- 54% of the day's
+                # entire AIMLAPI bill -- re-sending two prompts, one four
+                # times and one three, and it emptied the daily limit before
+                # four of the six clubs had made a single call.
+                #
+                # So a timeout is returned, never retried. This is deliberately
+                # conservative: a connect-timeout that never reached the server
+                # would have been safe to resend, but the SDKs do not reliably
+                # distinguish that from a read-timeout, and the downside is
+                # asymmetric -- an unnecessary retry costs real money, while a
+                # missed one costs one of MAX_MODEL_ERRORS attempts.
+                if "timeout" in type(e).__name__.lower() or isinstance(
+                        e, TimeoutError):
+                    return None, None, (
+                        msg + "  [not retried: the generation may have "
+                        "completed and been billed]")
                 if status == 400:
                     dropped = [p for p, aliases in DROPPABLE_PARAMS.items()
                                if p not in self._dropped_params
@@ -643,8 +667,17 @@ class LLMAgent:
                 base_url=root, api_key=key, timeout=REQUEST_TIMEOUT_S,
                 max_retries=0)
         max_tokens = getattr(self, "max_output", None) or 4096
+        # Cache the system prefix, read-billed at ~0.1x. _call_anthropic has
+        # done this all along; this path did not, so every retry re-bought the
+        # whole ~12,850-token prefix at full price. Input was $2.33 of one
+        # $9.51 session on 2026-09-02 for that reason.
+        if "cache_control" not in self._dropped_params:
+            system = [{"type": "text", "text": self.system_prompt,
+                       "cache_control": {"type": "ephemeral"}}]
+        else:
+            system = self.system_prompt
         kwargs = dict(model=self.model, max_tokens=max_tokens,
-                      system=self.system_prompt,
+                      system=system,
                       messages=[{"role": "user", "content": user_text}])
         if "thinking" not in self._dropped_params:
             # must be >= 1024 and < max_tokens; a ceiling, not a target —
