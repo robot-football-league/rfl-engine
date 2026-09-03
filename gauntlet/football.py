@@ -27,7 +27,7 @@ import numpy as np
 from .envelope import load_envelope
 from .episode import (BLEND_S, DECISION_PERIOD_S, ROT_HOLD_S, _AsyncDecider,
                       validate_action)
-from .g1_policy import G1PolicyController
+from .g1_policy import JOINT_ORDER, G1PolicyController
 from .render import EpisodeRenderer
 from .scene import SPAWN_HEIGHT, _texture_assets, quat_from_yaw
 from .util import CommandBlender, FallTracker, tilt_from_quat, yaw_from_quat
@@ -184,6 +184,12 @@ REPLAY_SAMPLE_HZ = 25.0
 # whole match offline (web/AR replays) without re-running physics. Off by
 # default; ~5 MB per 90 s match when on.
 STATE_RECORD_HZ = 25.0
+# STATES AND ACTIONS: log_dir/motion.npz + motion.json, written whenever the
+# pose track is (docs/MOTION.md). Sampled at the POLICY cadence, not the pose
+# track's 25 Hz, because the steps between two samples cannot be invented
+# afterwards and a training loop needs the action that was actually applied.
+# ~33 MB per 600 s match (measured, not guessed). RFL_SKIP_MOTION=1
+# turns it off.
 BUBBLE_S = 3.5            # how long a speech bubble stays above a player
 
 # managers: one LLM per team, each in its own dugout on the south touchline.
@@ -1017,6 +1023,103 @@ def _match_observation(ctrls, data, ball_qpos_adr, ball_qvel_adr, i, t,
     }
 
 
+def _motion_meta(ctrls, dt, team_of, team_names, agents):
+    """What the numbers in motion.npz mean — names, units, and the control
+    law, in array order. The arrays are unusable without it: the single most
+    common omission in a published robot dataset is failing to say whether an
+    actuator command is a position target or a torque. Ours is a torque."""
+    import hashlib
+
+    from .paths import G1_XML
+
+    c = ctrls[0]
+    decim = int(c.control_decimation)
+    hz = 1.0 / (dt * decim)
+    return {
+        "format": "4dgsx-motion",
+        "version": "0.1",
+        "control_hz": round(hz, 6),
+        "physics_hz": round(1.0 / dt, 6),
+        "physics_dt": float(dt),
+        "clock": "match seconds; the same clock as states.npz, track.bin and "
+                 "hud.json, so a goal at t=157.1 indexes straight in",
+        "robots": [
+            {"id": f"r{i}",
+             "body_prefix": f"r{i}_",
+             "team": "A" if team_of[i] == 0 else "B",
+             "team_name": team_names[team_of[i]],
+             "number": i % 2 + 1,
+             "agent": getattr(agents[i], "name", str(agents[i]))}
+            for i in range(N_ROBOTS)],
+        "model": {
+            "name": "unitree_g1_12dof",
+            "file": G1_XML.name,
+            "sha256": hashlib.sha256(G1_XML.read_bytes()).hexdigest(),
+            "source": "https://github.com/unitreerobotics/unitree_rl_gym",
+            "license": "BSD-3-Clause",
+            "note": "grafted unmodified into the RFL scene; the pitch, walls, "
+                    "goals and ball are built by football.build_football_model"},
+        # the model's own names, in array order. Robot i's joint is
+        # body_prefix + name; actuators carry the same names as their joints.
+        "joint_names": list(JOINT_ORDER),
+        "actuator_names": list(JOINT_ORDER),
+        "order_stable": True,
+        "qpos_layout": ["free_pos_xyz", "free_quat_wxyz", "joints"],
+        "qvel_layout": ["free_linvel_xyz_world", "free_angvel_xyz_body",
+                        "joint_vel"],
+        # the headline answer, kept where a reader trips over it first
+        "action_space": "torque",
+        "action_units": "N*m",
+        "arrays": {
+            "t": {"shape": ["nframes"], "units": "s"},
+            "qpos": {"shape": ["nframes", "nrobots", 19],
+                     "units": "m; unit quaternion wxyz; rad"},
+            "qvel": {"shape": ["nframes", "nrobots", 18],
+                     "units": "m/s; rad/s (body frame); rad/s"},
+            "ctrl": {"shape": ["nframes", "nrobots", 12],
+                     "space": "torque", "units": "N*m",
+                     "note": "the actuator command applied on the physics "
+                             "step this row was sampled at. It is RECOMPUTED "
+                             "every physics step from target_q by the PD law "
+                             "below, so this row is the first of `decimation` "
+                             "torques in the control period, not a constant "
+                             "held across it. To train on actions, use "
+                             "target_q; to reproduce the torque at 500 Hz, "
+                             "apply the law to target_q."},
+            "target_q": {"shape": ["nframes", "nrobots", 12],
+                         "space": "position_target", "units": "rad",
+                         "note": "the locomotion policy's output for this "
+                                 "control period, held for `decimation` "
+                                 "physics steps. THIS is the action half."},
+            "action": {"shape": ["nframes", "nrobots", 12],
+                       "space": "policy_output", "units": "dimensionless",
+                       "note": "target_q = action * action_scale + "
+                               "default_angles"},
+            "cmd": {"shape": ["nframes", "nrobots", 3],
+                    "space": "base_velocity_command",
+                    "units": "m/s, m/s, rad/s",
+                    "note": "(vx, vy, wz) in the robot's frame — the football "
+                            "decision, issued by the club's agent and tracked "
+                            "by the frozen locomotion policy. The one action "
+                            "in this file that is nobody's motor controller."},
+            "ball_qpos": {"shape": ["nframes", 7],
+                          "units": "m; unit quaternion wxyz",
+                          "note": "the ball's free joint. Without it these "
+                                  "states are not a state of the GAME."},
+            "ball_qvel": {"shape": ["nframes", 6], "units": "m/s; rad/s"}},
+        "pd": {
+            "law": "tau = (target_q - q) * kp + (0 - dq) * kd",
+            "kps": [float(v) for v in c.kps],
+            "kds": [float(v) for v in c.kds],
+            "default_angles": [float(v) for v in c.default_angles],
+            "action_scale": float(c.action_scale),
+            "decimation": decim,
+            "note": "frozen pretrained velocity-tracking policy, identical "
+                    "for all four robots and unchanged all season; only its "
+                    "cmd input differs between clubs"},
+    }
+
+
 def run_match(agents, match_time_s: float = MATCH_TIME_S,
               mode: str = "paused", realtime_factor: float = 1.0,
               decision_deadline_s: float | None = None,
@@ -1161,6 +1264,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
     if record_states is None:
         record_states = bool(os.environ.get("RFL_EXPORT_STATES"))
     state_rec = None
+    motion_rec = None
     if record_states and log_dir:
         log_dir.mkdir(parents=True, exist_ok=True)
         state_rec = {"t": [], "xpos": [], "xquat": [], "next_t": 0.0}
@@ -1175,6 +1279,24 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
             "kit_textures": kit_textures or {}}))
         if os.environ.get("RFL_EXPORT_MJB"):
             mujoco.mj_saveModel(model, str(log_dir / "scene.mjb"), None)
+        if not os.environ.get("RFL_SKIP_MOTION"):
+            players = ctrls[:N_ROBOTS]     # the managers are not playing
+            motion_rec = {
+                "ctrls": players,
+                "every": int(ctrls[0].control_decimation),
+                "t": [], "qpos": [], "qvel": [], "ctrl": [],
+                "target_q": [], "action": [], "cmd": [],
+                "ball_qpos": [], "ball_qvel": [],
+                # gather maps, so a sample is one fancy-index per array:
+                # each robot's free joint (7 / 6) followed by its 12 hinges
+                "qpos_idx": np.array([[c.base_qpos + n for n in range(7)]
+                                      + list(c.qpos_idx) for c in players]),
+                "qvel_idx": np.array([[c.base_qvel + n for n in range(6)]
+                                      + list(c.qvel_idx) for c in players]),
+                "ctrl_idx": np.array([list(c.ctrl_idx) for c in players]),
+            }
+            (log_dir / "motion.json").write_text(json.dumps(
+                _motion_meta(ctrls, dt, team_of, team_names, agents)))
     decisions_f = None
     telemetry_f = None
     comms_f = None
@@ -2227,6 +2349,26 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                 else:
                     c.set_command(*blenders[i].value(t))
                 c.apply_control(model, data)
+            # (state, action) BEFORE the step that consumes them, on the
+            # policy's own cadence: k % decimation == 0 is the first physics
+            # step after a policy update, so target_q here is this control
+            # period's fresh target rather than the tail of the last one.
+            if motion_rec is not None and k % motion_rec["every"] == 0:
+                mr = motion_rec
+                mr["t"].append(t)
+                mr["qpos"].append(data.qpos[mr["qpos_idx"]].astype(np.float32))
+                mr["qvel"].append(data.qvel[mr["qvel_idx"]].astype(np.float32))
+                mr["ctrl"].append(data.ctrl[mr["ctrl_idx"]].astype(np.float32))
+                mr["target_q"].append(np.array(
+                    [c.target_dof_pos for c in mr["ctrls"]], np.float32))
+                mr["action"].append(np.array(
+                    [c.action for c in mr["ctrls"]], np.float32))
+                mr["cmd"].append(np.array(
+                    [c.cmd for c in mr["ctrls"]], np.float32))
+                mr["ball_qpos"].append(
+                    data.qpos[ball_qpos_adr:ball_qpos_adr + 7].astype(np.float32))
+                mr["ball_qvel"].append(
+                    data.qvel[ball_qvel_adr:ball_qvel_adr + 6].astype(np.float32))
             mujoco.mj_step(model, data)
             for c in ctrls:
                 c.advance(data)
@@ -2647,6 +2789,17 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                 body_names=np.array([model.body(b).name
                                      for b in range(model.nbody)]),
                 hz=np.float32(STATE_RECORD_HZ))
+        if motion_rec is not None and motion_rec["t"]:
+            mr = motion_rec
+            np.savez_compressed(
+                log_dir / "motion.npz",
+                t=np.asarray(mr["t"], dtype=np.float32),
+                qpos=np.stack(mr["qpos"]), qvel=np.stack(mr["qvel"]),
+                ctrl=np.stack(mr["ctrl"]), target_q=np.stack(mr["target_q"]),
+                action=np.stack(mr["action"]), cmd=np.stack(mr["cmd"]),
+                ball_qpos=np.stack(mr["ball_qpos"]),
+                ball_qvel=np.stack(mr["ball_qvel"]),
+                hz=np.float32(1.0 / (dt * mr["every"])))
         if renderer:
             renderer.close()
         if decisions_f:
