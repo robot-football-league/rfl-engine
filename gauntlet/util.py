@@ -2,7 +2,34 @@
 
 from __future__ import annotations
 
+import inspect
+
 import numpy as np
+
+
+def call_begin_episode(obj, log_dir=None):
+    """Call obj.begin_episode at kickoff, passing log_dir only if the hook takes it.
+
+    The contract (docs/RFL_RULES.md) is begin_episode(log_dir=None), and the
+    hook is optional. On 2026-09-05 a club's round-2 wrapper declared
+    begin_episode(self); the keyword raised TypeError at football.py's
+    kickoff, m12 could not render, and a slot was hours from airing nothing.
+    Scrutineering cannot see a signature and the rule's last-good-commit
+    fallback is not implemented, so the engine tolerates the bare form here:
+    a club that ignores log_dir loses only its own per-episode logs. When the
+    signature cannot be read at all, the contract form is used and any error
+    is the club's.
+    """
+    hook = getattr(obj, "begin_episode", None)
+    if hook is None:
+        return None
+    try:
+        params = inspect.signature(hook).parameters
+    except (TypeError, ValueError):
+        return hook(log_dir=log_dir)
+    takes_it = "log_dir" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    return hook(log_dir=log_dir) if takes_it else hook()
 
 
 def yaw_from_quat(q) -> float:

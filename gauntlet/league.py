@@ -14,9 +14,18 @@ per broadcast slot.
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import yaml
+
+
+def _utc_now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _load(league_path):
@@ -30,6 +39,137 @@ def _load(league_path):
 
 def _team_name(team_dir):
     return yaml.safe_load((Path("teams") / team_dir / "team.yaml").read_text())
+
+
+# How many commits back the league will look for code that plays. Ten, since
+# 2026-09-21 (NOTICES): the published rule is "your LAST GOOD commit", and
+# three — enough to step over a bad night and the night before it — was
+# reached and beaten by a club that shipped six broken nights in a row.
+# frontier_muse's last good commit was HEAD~6 and every fixture of its from
+# m34 on was skipped for it. Ten is still few enough that a club cannot drift
+# a month into its own past unnoticed: the skip alert names the fixture, and
+# `_last_good` prints how far back it went.
+FALLBACK_DEPTH = 10
+
+
+def _kickoff_check(team_dir, team_index: int):
+    """Do to a club exactly what the match will do to it — load team.py,
+    build_team(ctx), begin_episode on every player and the manager — in a
+    throwaway log dir, and return the error string if any of it raises.
+
+    The rule in every gaffer's prompt says code that fails to load on match
+    day is replaced by the club's last good commit. Until 2026-09-05 nothing
+    enforced that at match time: scrutineering is static (imports and
+    config), so a wrapper with a bad kickoff signature cleared it, the
+    render died 18 s in, and the fixture was simply not played. This is the
+    dynamic half. It costs a second or two per club and no tokens.
+    """
+    from .rfl import ENGINE_VERSION, load_team
+    from .util import call_begin_episode
+    team_dir = Path(team_dir)
+    try:
+        team = load_team(team_dir)
+        ctx = {"engine_version": ENGINE_VERSION, "team_index": team_index,
+               "config": yaml.safe_load((team_dir / "team.yaml").read_text())}
+        squad = team.build(ctx)
+        with tempfile.TemporaryDirectory() as td:
+            for i, agent in enumerate(squad["players"]):
+                if hasattr(agent, "begin_episode"):
+                    d = Path(td) / f"r{i}"
+                    d.mkdir()
+                    call_begin_episode(agent, d)
+            mgr = squad.get("manager")
+            if mgr is not None and hasattr(mgr, "begin_episode"):
+                d = Path(td) / "manager"
+                d.mkdir()
+                call_begin_episode(mgr, d)
+    except Exception as e:                       # anything: it is the match
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
+def kickoff_main(team_dir) -> int:
+    """`python -m gauntlet kickoff teams/<club>`: what match day does to a
+    club before a ball is kicked, in the order it does it — scrutineering,
+    then build_team(ctx) and begin_episode for both team indexes. No tokens.
+
+    Exists because the 2026-09-15 and 2026-09-21 notices sent clubs to
+    `lint`, which is static and cleared six consecutive commits that raised
+    at kickoff. A club could not run the dynamic half itself; now it can.
+    """
+    from .rfl_lint import check_team
+    team_dir = Path(team_dir)
+    problems = check_team(team_dir)
+    if problems:
+        print(f"SCRUTINEERING FAILED: {team_dir}")
+        for pr in problems:
+            print(f"  - {pr}")
+        return 1
+    print(f"scrutineering clear: {team_dir}")
+    for idx in (0, 1):
+        err = _kickoff_check(team_dir, idx)
+        if err:
+            print(f"KICKOFF FAILED (as team {idx}): {team_dir}\n  {err}\n"
+                  f"  On match day this code would not play: the match-day "
+                  f"rule looks up to {FALLBACK_DEPTH} commits back for one "
+                  f"that starts.")
+            return 1
+    print(f"kickoff clear: {team_dir} (build_team + begin_episode ran as "
+          f"home and as away)")
+    return 0
+
+
+def _last_good(side: str, team_index: int, root: Path, teams_dir=Path("teams")):
+    """The directory to play `side` from, and a record of any fallback.
+
+    The live checkout if it passes _kickoff_check. Otherwise the newest of
+    its last FALLBACK_DEPTH commits that BOTH clears scrutineering AND
+    passes the same check, exported with `git archive` into
+    runs/league/s<N>/fallback/<club>/<sha>/ — the club's repository is never
+    touched. Returns (path, None) when the live code is fine, (path, record)
+    when a fallback was taken, and (path, record with played=None) when
+    nothing within reach is playable, which the caller treats as "fixture
+    not played", exactly as before.
+    """
+    from .rfl import _git_out
+    from .rfl_lint import check_team
+    live = teams_dir / side
+    err = _kickoff_check(live, team_index)
+    if err is None:
+        return str(live), None
+    head = _git_out(live, "rev-parse", "--short", "HEAD") or "(no git)"
+    print(f"  [league] {side} @ {head} fails at kickoff: {err}")
+    record = {"failed": head, "error": err, "played": None, "back": 0}
+    if not (live / ".git").exists():
+        return str(live), record
+    for n in range(1, FALLBACK_DEPTH + 1):
+        sha = _git_out(live, "rev-parse", "--short", f"HEAD~{n}")
+        if not sha:
+            break
+        dest = root / "fallback" / side / sha
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.mkdir(parents=True)
+        arc = subprocess.run(["git", "-C", str(live), "archive", f"HEAD~{n}"],
+                             capture_output=True)
+        if arc.returncode != 0:
+            continue
+        subprocess.run(["tar", "-x", "-C", str(dest)], input=arc.stdout,
+                       check=True)
+        problems = check_team(dest)
+        if problems:
+            print(f"  [league] {side} @ {sha} (HEAD~{n}) fails scrutineering "
+                  f"— skipping: {problems[0]}")
+            continue
+        e2 = _kickoff_check(dest, team_index)
+        if e2 is None:
+            print(f"  [league] {side}: playing last good commit {sha} "
+                  f"(HEAD~{n}) — the match-day rule")
+            record.update({"played": sha, "back": n})
+            return str(dest), record
+        print(f"  [league] {side} @ {sha} (HEAD~{n}) also fails at kickoff: {e2}")
+    print(f"  [league] {side}: no playable commit within {FALLBACK_DEPTH}")
+    return str(live), record
 
 
 def double_round_robin(teams):
@@ -75,10 +215,84 @@ def _rollover(league_path, cfg, root):
           f"begins: {len(cfg2['fixtures'])} matches (double round robin)")
 
 
+def _accounted(state) -> set:
+    """Fixture numbers the league is finished with: played, or skipped.
+
+    `k = len(state["played"])` was fine while every fixture either played or
+    stopped the league. Now that an unplayable fixture is skipped, the played
+    list has gaps in it, and the fixture NUMBER is the only honest key — which
+    is what every consumer already uses (`volumetric.py`, `broadcast.py`
+    filter on `m["fixture"]`, never on list position).
+    """
+    return ({m["fixture"] for m in state.get("played", [])}
+            | set(state.get("skipped_fixtures", [])))
+
+
+def _next_index(state, fixtures) -> int:
+    """0-based index of the first fixture neither played nor skipped."""
+    done = _accounted(state)
+    for i in range(len(fixtures)):
+        if i + 1 not in done:
+            return i
+    return len(fixtures)
+
+
+def _write_state(path, state):
+    """An interrupted result writer must leave the previous table readable."""
+    path = Path(path)
+    name = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent,
+                                         prefix=".table-", suffix=".tmp",
+                                         delete=False) as f:
+            name = f.name
+            json.dump(state, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(name, path)
+    finally:
+        if name is not None:
+            Path(name).unlink(missing_ok=True)
+
+
+def _skip_fixture(state, state_p, k, home, away, why):
+    """Record fixture k+1 as not played, say so loudly, and keep the league
+    moving. Until 2026-09-15 this path returned None instead, and the loop
+    then retried the SAME fixture every hour forever — one club took the
+    whole league off air for three slots (frontier_muse, nights 17-22, its
+    build_team using ctx.player_model against a ctx that is a dict). The
+    club-facing half is in config/NOTICES.md, 2026-09-15.
+    """
+    n = k + 1
+    state.setdefault("skipped_fixtures", []).append(n)
+    state.setdefault("skipped", []).append(
+        {"fixture": n, "home": home, "away": away, "why": why,
+         "at": _utc_now()})
+    _write_state(state_p, state)
+    print(f"  [league] m{n} {home} v {away} NOT PLAYED — {why}")
+    print(f"  [league] skipped; moving to the next fixture")
+    try:
+        from . import alert as _alert
+        _alert.alert(f"m{n} skipped: {home} v {away} — {why}")
+    except Exception as e:
+        print(f"  [league] alert failed: {type(e).__name__}: {e}")
+
+
 def play_next(league_path="league.yaml", audio=True):
+    # Also protects direct CLI/library use, before _load can create a season
+    # or read a table. render_next descendants reuse a VERIFIED inherited FD.
+    from .render_lock import render_lock
+    from .render_capacity import require_render_capacity
+    with render_lock():
+        # Before _load, fallback exports or output creation, including direct use.
+        require_render_capacity()
+        return _play_next_locked(league_path, audio)
+
+
+def _play_next_locked(league_path, audio):
     cfg, root, state_p, state = _load(league_path)
     fixtures = cfg["fixtures"]
-    k = len(state["played"])
+    k = _next_index(state, fixtures)
     if k >= len(fixtures):
         print(f"season {cfg.get('season', 1)} complete "
               f"({len(fixtures)} matches played)")
@@ -94,8 +308,11 @@ def play_next(league_path="league.yaml", audio=True):
         # air, including the finale. Refuse, and say what is holding it.
         bp = root / "broadcast.json"
         bs = json.loads(bp.read_text()) if bp.exists() else {"streamed": []}
+        # A skipped fixture was never rendered and will never be streamed,
+        # so it must not hold the season open for ever.
+        skipped = set(state.get("skipped_fixtures", []))
         unaired = [i for i in range(1, len(fixtures) + 1)
-                   if i not in bs.get("streamed", [])]
+                   if i not in bs.get("streamed", []) and i not in skipped]
         if unaired:
             print(f"  NOT rolling over: {len(unaired)} match(es) rendered "
                   f"but not yet aired ({', '.join(f'm{i}' for i in unaired)})."
@@ -107,23 +324,50 @@ def play_next(league_path="league.yaml", audio=True):
         cfg, root, state_p, state = _load(league_path)   # fresh season dir
         fixtures = cfg["fixtures"]
         k = 0
-    home, away = fixtures[k]
+    # Walk forward over fixtures nobody can play. Each one is recorded and
+    # alerted on; the league does not stop for it (NOTICES, 2026-09-15).
     from .rfl_lint import check_team
-    blocked = False
-    for side in (home, away):
-        problems = check_team(f"teams/{side}")
-        if problems:
-            print(f"  [league] {side} fails scrutineering — fixture not played:")
-            for pr in problems:
-                print(f"    - {pr}")
-            blocked = True
-    if blocked:
-        return None
-    out = root / f"m{k + 1}_{home}_{away}"
-    out.mkdir(exist_ok=True)
+    while True:
+        if k >= len(fixtures):
+            print("  [league] no playable fixture remains in this season")
+            return None
+        home, away = fixtures[k]
+        out = root / f"m{k + 1}_{home}_{away}"
+        # A stale/pulled table must never authorize overwriting a completed
+        # match (or debris from an interrupted writer). Refuse before checks
+        # can skip the fixture or otherwise mutate state. Recovery is explicit.
+        if os.path.lexists(out):
+            raise FileExistsError(f"refusing existing match output: {out}; "
+                                  "inspect/recover it before retrying")
+        why = None
+        for side in (home, away):
+            problems = check_team(f"teams/{side}")
+            if problems:
+                print(f"  [league] {side} fails scrutineering:")
+                for pr in problems:
+                    print(f"    - {pr}")
+                why = why or f"{side} fails scrutineering: {problems[0]}"
+        if why is None:
+            # The match-day rule, enforced where it bites (see _kickoff_check).
+            home_path, home_fb = _last_good(home, 0, root)
+            away_path, away_fb = _last_good(away, 1, root)
+            for side, fb in ((home, home_fb), (away, away_fb)):
+                if fb and fb["played"] is None:
+                    why = why or (f"{side} has no playable commit within "
+                                  f"{FALLBACK_DEPTH}: {fb['error']}")
+        if why is None:
+            break
+        _skip_fixture(state, state_p, k, home, away, why)
+        k = _next_index(state, fixtures)
+    # Exclusive creation is the final guard even against non-cooperating
+    # writers. Leave partial output intact on failure; never retry in place.
+    out.mkdir(exist_ok=False)
+    if home_fb or away_fb:
+        (out / "fallback.json").write_text(json.dumps(
+            {"home": home_fb, "away": away_fb}, indent=1))
     from .rfl import run_rfl_match
     res = run_rfl_match(
-        f"teams/{home}", f"teams/{away}",
+        home_path, away_path,
         match_time_s=float(cfg.get("match_time_s", 600)),
         halves=int(cfg.get("halves", 2)),
         record_states=True,   # every fixture becomes volumetric-exportable
@@ -138,24 +382,75 @@ def play_next(league_path="league.yaml", audio=True):
              "players": {"home": roster(home), "away": roster(away)},
              "dir": str(out)}
     state["played"].append(entry)
-    state_p.write_text(json.dumps(state, indent=2))
+    _write_state(state_p, state)
+    # Seal the table at this result, before later renders can change it.
+    # The exporter only consumes this sidecar; it never backfills an old
+    # recording from whatever league.yaml/table.json happens to say today.
+    try:
+        from .broadcast import _teams_cfg
+        from .fulltime_table import write_snapshot
+        write_snapshot(out, cfg, state["played"], _teams_cfg(cfg), k + 1,
+                       res.to_dict())
+    except Exception as e:
+        # A missing graphic must not cost the commentary/audio/export pass
+        # of an already-played match. Never guess a replacement table.
+        print(f"  [full-time table] skipped: {type(e).__name__}: {e}")
     if audio:
         try:                    # commentary first so the mix can embed it
             from .commentary import (build_card_audio, synthesize,
                                      write_card_scripts, write_script)
             write_script(out, league=league_path)
-            try:                # build-up + wrap-up for the programme cards;
+            # CARD COMMENTARY IS OFF UNLESS ASKED FOR. This is a budget
+            # decision, not a judgement about the writing.
+            #
+            # The build-up and wrap-up are 4,322 of the 8,894 characters a
+            # match sends to TTS — 48% of the bill — for speech over the
+            # pre-roll countdown and the post-match result card, either side
+            # of the football. Measured 2026-09-04: at ElevenLabs' Creator
+            # allowance and the flash_v2_5 rate (0.275 credits/char, measured
+            # in isolation, NOT the 1.0 its multiplier implies), the league
+            # gets 49.5 matches a month with cards and 96.3 without, against
+            # 90 needed. Shortening them does not close that: the budget
+            # leaves 319 characters for cards once the match commentary has
+            # had its share, and cutting far enough to matter drives the card
+            # to ~44% speech — the density that left "a 16 s hole between
+            # every line" and was heard on air. So it is all or nothing, and
+            # this is the end that keeps the football.
+            #
+            # Everything downstream degrades correctly: synthesize() skips
+            # files that do not exist, build_card_audio() skips them too, and
+            # broadcast._card_video falls back to the plain crowd-hum card it
+            # always built. Set RFL_CARD_COMMENTARY=1 to turn them back on.
+            if os.environ.get("RFL_CARD_COMMENTARY", "").strip().lower() in (
+                    "1", "true", "yes"):
+                try:            # build-up + wrap-up for the programme cards;
                                 # never let them cost the match commentary
-                write_card_scripts(out, league=league_path)
-            except Exception as e:
-                print(f"  [commentary] card scripts skipped: {e}")
+                    write_card_scripts(out, league=league_path)
+                except Exception as e:
+                    print(f"  [commentary] card scripts skipped: {e}")
+            else:
+                print("  [cards] commentary OFF (RFL_CARD_COMMENTARY unset) — "
+                      "cards keep their crowd hum; saves ~48% of the TTS bill")
             synthesize(out)
             try:
                 build_card_audio(out)
             except Exception as e:
                 print(f"  [cards] audio skipped: {e}")
-        except Exception as e:  # no key / no quota: crowd-only broadcast
-            print(f"  [commentary] skipped: {e}")
+        except Exception as e:  # crowd-only broadcast — say so out loud
+            # This used to guess "no key / no quota" in a comment and print
+            # one line. On 2026-09-08 it swallowed a Gemini MAX_TOKENS
+            # truncation twice and two matches aired silent; the key and the
+            # quota were both fine. It alerts now, and broadcast_audio
+            # shouts again when it finds no script to place.
+            print(f"  [commentary] skipped: {type(e).__name__}: {e}")
+            try:
+                from . import alert as _alert
+                _alert.alert(
+                    "Commentary script FAILED — match will air crowd-only",
+                    f"{Path(out).name}: {type(e).__name__}: {e}",
+                    severity="error")
+            except Exception as ae:     # never fail a render over an alert
+                print(f"  [commentary] (alert failed: {ae})")
         try:
             from .broadcast_audio import add_match_audio
             add_match_audio(out)

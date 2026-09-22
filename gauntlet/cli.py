@@ -144,6 +144,11 @@ def main(argv=None):
     lt = sub.add_parser("lint", help="scrutineering: check a team dir against league law")
     lt.add_argument("team")
 
+    kt = sub.add_parser("kickoff", help="what match day does before a ball is "
+                        "kicked: scrutineering, then build_team + "
+                        "begin_episode with the real ctx (no tokens)")
+    kt.add_argument("team")
+
     gf = sub.add_parser("gaffer", help="run one gaffer night session for a club")
     gf.add_argument("--team", required=True)
     gf.add_argument("--model", required=True, help="llm:<provider>:<model>")
@@ -166,6 +171,11 @@ def main(argv=None):
         from .rfl_lint import main as lint_main
         import sys
         sys.exit(lint_main(args.team))
+
+    if args.cmd == "kickoff":
+        from .league import kickoff_main
+        import sys
+        sys.exit(kickoff_main(args.team))
 
     if args.cmd == "gaffer":
         from .gaffer import run_night

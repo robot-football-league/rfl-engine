@@ -30,13 +30,22 @@ from .episode import (BLEND_S, DECISION_PERIOD_S, ROT_HOLD_S, _AsyncDecider,
 from .g1_policy import JOINT_ORDER, G1PolicyController
 from .render import EpisodeRenderer
 from .scene import SPAWN_HEIGHT, _texture_assets, quat_from_yaw
-from .util import CommandBlender, FallTracker, tilt_from_quat, yaw_from_quat
+from .util import (CommandBlender, FallTracker, call_begin_episode,
+                   tilt_from_quat, yaw_from_quat)
 
 # pitch (meters, half-extents where noted)
 PITCH_X = 7.0          # half-length: goal lines at x = +-7
 PITCH_Y = 4.5          # half-width
 WALL_H = 0.9
 WALL_T = 0.1
+# THE FENCE (2026-09-07, Robin: "a really minimal fence so the ball can't
+# escape"). The first trained kick lofts the ball to ~1.3 m off a 0.9 m wall.
+# Translucent panels from the wall top to FENCE_TOP, ball-only collision
+# (the ball's contype carries bit 4; the fence answers bit 4 and nothing
+# else does — bit 2 is the pelvis bumpers'), so robots and the audio tape's
+# wall impacts are untouched.
+FENCE_H = 1.6             # fence top at WALL_H + FENCE_H = 2.5 m
+FENCE_RGBA = "0.85 0.9 1.0 0.08"
 GOAL_HALF_W = 1.6      # goal mouth: |y| < 1.6 (generous for 0.35 m-ball play)
 GOAL_DEPTH = 0.7       # netted pocket behind the line
 POST_R = 0.08
@@ -52,6 +61,9 @@ BALL_MASS = 0.45
 BALL_RGBA = "0.95 0.15 0.75 1"  # high-vis magenta: nothing else on the pitch
                                 # is this color, and the old checker pattern
                                 # aliased into the checkered grass at range
+# ...and since the football skin (BALL_PANEL_*, _ball_texture) the geom
+# wears a material, not this rgba: the light panels ARE this colour, and
+# rfl_sdk.detect_ball_pixels is tuned to it. Kept as that reference.
 
 # football egocam pitches steeper than the race default: a striker must see
 # its own feet — at 10 deg the ground closer than ~1.5 m is below the frame
@@ -91,14 +103,29 @@ PERCEPT_PERIOD_S = 0.4
 
 MATCH_TIME_S = 90.0
 KICKOFF_FREEZE_S = 0.5   # command blend-in after each reset
-# The FULL TIME banner appears WITH the whistle, not before it. It does not
-# need a lead to be readable: broadcast_audio muxes the match with
-# `tpad=stop_mode=clone` (OUTRO_S = 8 s), so whatever is on the final frame
-# is held for eight seconds over the long whistle and the sign-off. The
-# first cut showed it from T-2.5, which put the graphic on screen a full
-# two seconds before the whistle sounded and the players stopped.
-FULL_TIME_BANNER_LEAD_S = 0.3   # = broadcast_audio's whistle onset (t_end-0.3)
-HALF_BREAK_S = 12.0      # halftime pause (banner + robots reset to
+# THE BUZZER (2026-09-07). Each half ends on a BUZZER, not a whistle, and
+# the buzzer CUTS THE POWER to every robot on the premises — both sides and
+# both dugouts. Football's whistle means "you may no longer play the ball";
+# this league means the opposite, and the sound is different so nobody
+# confuses the two. The robots stop. The BALL DOES NOT. Play runs on under
+# physics alone until the ball comes to rest, and a ball that crosses the
+# line inside that window is a goal — basketball's buzzer, where the shot
+# has to leave before it and what happens after it counts.
+#
+# Before this, the last frame of the match simply froze under a long
+# whistle and the players stood still under power through the interval.
+# The FULL TIME banner is drawn when the ball finally dies rather than at a
+# fixed lead: broadcast_audio muxes with `tpad=stop_mode=clone` (OUTRO_S =
+# 8 s), so whatever is on the final frame is held for eight seconds over
+# the sign-off, and the banner needs no lead to be readable.
+BUZZER_DEAD_MIN_S = 5.0   # always run this long: the collapse IS the moment
+BUZZER_DEAD_MAX_S = 10.0  # a ball rattling off walls cannot stretch a half
+BALL_REST_MPS = 0.10      # "at rest". Rolling friction (0.02, turf) takes the
+                          # last 10 cm/s off in ~0.5 s and 2.5 cm, so calling
+                          # it dead here cuts nothing off that could score.
+FULL_TIME_HOLD_S = 1.5    # real frames of FULL TIME banner before the outro
+HALF_BREAK_S = 12.0      # halftime pause AFTER the dead ball (banner +
+                         # robots reset to
                          # kickoff): long enough to read as a real
                          # interval — whistle, stillness, whistle
 # sound-event tape: ball impulse events sampled at 25 Hz for the broadcast
@@ -142,6 +169,7 @@ FALL_RECOVERY_S = 8.0
 # the shaft extends, sweeping the corner clear. Slow enough to be safe-ish,
 # firm enough to shift a ball and unbalance a robot standing in the way.
 CORNER_ARM_S = 4.5          # seconds in the corner before the ram fires
+CORNER_LABEL_THRESHOLD = 0.05  # fraction charged before showing the countdown
 # Trigger is a corner PROXIMITY sensor (photoelectric beam / referee vision in
 # real hardware), not a contact switch: a bouncy ball rarely rests against a
 # panel, but a ball loitering in the corner — usually because robots are
@@ -400,6 +428,142 @@ def _board_texture(design: str, w_m: float) -> Path:
     return out
 
 
+BALL_PANEL_LIGHT = (242, 38, 191)     # = BALL_RGBA, the colour we already air
+BALL_PANEL_DARK = (150, 20, 118)      # same hue, ~60% luminance
+BALL_PANEL_SEAM = (255, 130, 225)
+BALL_SEAM_W = 0.010                   # seam half-width, in cosine-distance
+
+
+def _truncated_icosahedron():
+    """The real football, exactly: 12 pentagons and 20 hexagons.
+
+    Built the way the solid is defined — truncate every vertex of an
+    icosahedron one third of the way along each edge. The 12 pentagons are
+    the cut-off vertices; the 20 triangles become hexagons.
+
+    WHY NOT A VORONOI OVER THE 32 FACE CENTRES, which is the tempting
+    shortcut: it gets the topology right (12 five-sided cells, 20 six-sided,
+    no two pentagons adjacent) and the PROPORTIONS wrong. Measured
+    2026-09-08, that approximation gave pentagons covering 36.2% of the ball
+    against a real 28.4%, with hexagons only 1.06x the pentagon's area
+    instead of 1.51x — near-equal panels, which is not what a football looks
+    like, and Robin spotted it on the first render. The cause is that a plain
+    Voronoi weights every centre equally, while the real solid's pentagon
+    faces sit further from the centre (plane offset 0.8157) than its hexagon
+    faces (0.7947). That difference IS the shape.
+
+    Returns (plane normals, plane offsets, is_pentagon) for the 32 faces.
+    """
+    phi = (1 + 5 ** 0.5) / 2
+    V = []
+    for s1 in (1, -1):
+        for s2 in (1, -1):
+            V += [(0.0, s1 * 1.0, s2 * phi), (s1 * 1.0, s2 * phi, 0.0),
+                  (s2 * phi, 0.0, s1 * 1.0)]
+    V = np.array(sorted(set(V)), dtype=float)
+    V /= np.linalg.norm(V, axis=1, keepdims=True)
+    # Put a pentagon on the texture's pole: an equirectangular map has a
+    # singularity there, and inside a flat-coloured panel nothing shows.
+    axis = np.cross(V[0], [0.0, 0.0, 1.0])
+    nn = np.linalg.norm(axis)
+    if nn > 1e-9:
+        axis = axis / nn
+        ang = float(np.arccos(np.clip(V[0] @ [0.0, 0.0, 1.0], -1.0, 1.0)))
+        K = np.array([[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]],
+                      [-axis[1], axis[0], 0.0]])
+        V = V @ (np.eye(3) + np.sin(ang) * K + (1 - np.cos(ang)) * (K @ K)).T
+    D = np.linalg.norm(V[:, None] - V[None, :], axis=-1)
+    edge = D[D > 1e-9].min()
+    nbr = [np.where(np.abs(D[i] - edge) < 1e-6)[0] for i in range(12)]
+    tris = []
+    for i in range(12):
+        for j in nbr[i]:
+            if j <= i:
+                continue
+            for k in nbr[i]:
+                if k > j and abs(D[j, k] - edge) < 1e-6:
+                    tris.append((i, j, k))
+    normals, offsets, pent = [], [], []
+    for i in range(12):                                   # pentagons
+        P = np.array([(2 / 3) * V[i] + (1 / 3) * V[j] for j in nbr[i]])
+        n = P.mean(0)
+        n /= np.linalg.norm(n)
+        normals.append(n)
+        offsets.append(float(P[0] @ n))
+        pent.append(True)
+    for a, b, c in tris:                                  # hexagons
+        P = []
+        for x, y in ((a, b), (b, c), (c, a)):
+            P += [(2 / 3) * V[x] + (1 / 3) * V[y], (1 / 3) * V[x] + (2 / 3) * V[y]]
+        P = np.array(P)
+        n = P.mean(0)
+        n /= np.linalg.norm(n)
+        normals.append(n)
+        offsets.append(float(P[0] @ n))
+        pent.append(False)
+    return np.array(normals), np.array(offsets), np.array(pent)
+
+
+# MuJoCo cube-map faces, PROBED not assumed (2026-09-08): right=+x, left=-x,
+# up=+y, down=-y, front=+z, back=-z, with OpenGL's in-plane axes. Each entry
+# is (u axis, v axis, face normal).
+BALL_CUBE_FACES = {
+    "right": ((0, 0, -1), (0, -1, 0), (1, 0, 0)),
+    "left": ((0, 0, 1), (0, -1, 0), (-1, 0, 0)),
+    "up": ((1, 0, 0), (0, 0, 1), (0, 1, 0)),
+    "down": ((1, 0, 0), (0, 0, -1), (0, -1, 0)),
+    "front": ((1, 0, 0), (0, -1, 0), (0, 0, 1)),
+    "back": ((-1, 0, 0), (0, -1, 0), (0, 0, -1)),
+}
+BALL_CUBE_S = 512          # pixels per cube face
+
+
+def _ball_texture() -> dict:
+    """The football's skin, as a CUBE MAP: one image per cube face, keyed by
+    the MuJoCo attribute that carries it. Cached in runs/assets; delete the
+    files to regenerate.
+
+    A cube map rather than the obvious equirectangular sheet, because an
+    equirectangular texture on a MuJoCo sphere is stretched (its aspect
+    convention is not the 2:1 the format implies) and has a pole singularity
+    that smears the panels into a fan. Both were visible on the first
+    renders. A cube map has neither: every texel maps to a direction with no
+    special axis, so the panels come out regular and the seams run
+    continuously across the face joins.
+
+    Scale-free: the same six images skin the G1's 0.70 m ball and the duck's
+    0.07 m one.
+    """
+    from . import paths
+    out_dir = paths.ROOT / "runs" / "assets"
+    files = {f"file{name}": out_dir / f"ball_cube_{name}_{BALL_CUBE_S}.png"
+             for name in BALL_CUBE_FACES}
+    if all(p.exists() for p in files.values()):
+        return {k: str(v) for k, v in files.items()}
+    out_dir.mkdir(parents=True, exist_ok=True)
+    N, Hh, is_pent = _truncated_icosahedron()
+    t = (np.arange(BALL_CUBE_S) + 0.5) / BALL_CUBE_S * 2 - 1
+    uu, vv = np.meshgrid(t, t)
+    from PIL import Image
+    for name, (ax_u, ax_v, ax_n) in BALL_CUBE_FACES.items():
+        d = (np.array(ax_n)[None, None, :]
+             + uu[..., None] * np.array(ax_u) + vv[..., None] * np.array(ax_v))
+        d /= np.linalg.norm(d, axis=-1, keepdims=True)
+        # gnomonic: the ray leaves the solid through the face maximising
+        # (d . n) / h — the real ball's panels, inflated onto a sphere
+        score = (d.reshape(-1, 3) @ N.T) / Hh
+        order = np.argsort(-score, axis=1)
+        top = np.take_along_axis(score, order[:, :1], 1)[:, 0]
+        nxt = np.take_along_axis(score, order[:, 1:2], 1)[:, 0]
+        img = np.where(is_pent[order[:, 0]][:, None],
+                       np.array(BALL_PANEL_DARK),
+                       np.array(BALL_PANEL_LIGHT)).astype(float)
+        img[(top - nxt) < BALL_SEAM_W] = BALL_PANEL_SEAM
+        shaped = img.reshape(BALL_CUBE_S, BALL_CUBE_S, 3).astype(np.uint8)
+        Image.fromarray(shaped).save(files[f"file{name}"])
+    return {k: str(v) for k, v in files.items()}
+
+
 def _pitch_xml(team_colors=TEAM_RGBA) -> str:
     root = ET.Element("mujoco", {"model": "g1_football_pitch"})
     vis = ET.SubElement(root, "visual")
@@ -419,9 +583,12 @@ def _pitch_xml(team_colors=TEAM_RGBA) -> str:
     ET.SubElement(asset, "material", {
         # one texture tile spans a mower's there-and-back, so texrepeat is
         # the number of stripe PAIRS down the pitch
-        # texuniform makes texrepeat world-scaled. One tile is a there-and
-        # -back mowing pass (2 stripes), so 0.5 = a 2 m pass = 1 m stripes:
-        # 14 across the 14 m pitch, 7 per half.
+        # texuniform makes texrepeat world-scaled. MEASURED off the compiled
+        # model 2026-09-03: one tile spans 2/texrepeat metres, so 0.5 is a
+        # 4 m there-and-back pass = 2 m stripes, SEVEN across the 14 m pitch.
+        # (This comment read "a 2 m pass = 1 m stripes: 14 across" until then
+        # — off by a factor of two, and it was believed while writing the
+        # bundle's turf description. The model is the source of truth.)
         # reflectance 0: the floor is a plane, and MuJoCo mirrors the scene
         # in any reflective plane. At 0.06 that sheen was invisible against
         # gray checker walls, but the advertising boards put legible type on
@@ -455,9 +622,19 @@ def _pitch_xml(team_colors=TEAM_RGBA) -> str:
             g["material"] = "mat_wall"
         ET.SubElement(wb, "geom", g)
 
+    def fence(name, cx, cy, sx, sy):
+        # sits on the wall top; contype 0 so it initiates nothing, conaffinity 4
+        # so only the ball (contype 5) can hit it; no shadow, faint tint
+        ET.SubElement(wb, "geom", {
+            "name": name, "type": "box", "size": f"{sx} {sy} {FENCE_H / 2}",
+            "pos": f"{cx} {cy} {WALL_H + FENCE_H / 2}", "contype": "0",
+            "conaffinity": "4", "rgba": FENCE_RGBA, "group": "2"})
+
     # side walls (full length incl. goal pockets)
     wall("wall_n", 0, PITCH_Y + WALL_T, PITCH_X + GOAL_DEPTH + 2 * WALL_T, WALL_T)
     wall("wall_s", 0, -PITCH_Y - WALL_T, PITCH_X + GOAL_DEPTH + 2 * WALL_T, WALL_T)
+    fence("fence_n", 0, PITCH_Y + WALL_T, PITCH_X + GOAL_DEPTH + 2 * WALL_T, WALL_T)
+    fence("fence_s", 0, -PITCH_Y - WALL_T, PITCH_X + GOAL_DEPTH + 2 * WALL_T, WALL_T)
     # end walls: solid outside the goal mouth, netted pocket behind the mouth
     seg = (PITCH_Y - GOAL_HALF_W) / 2
     # goal pockets are painted with the DEFENDING team's color so vision-only
@@ -482,15 +659,25 @@ def _pitch_xml(team_colors=TEAM_RGBA) -> str:
         wall(f"net_{tag}_back", sgn * (PITCH_X + GOAL_DEPTH), 0, WALL_T, GOAL_HALF_W, rgba=pc)
         wall(f"net_{tag}_top", sgn * (PITCH_X + GOAL_DEPTH / 2), GOAL_HALF_W, GOAL_DEPTH / 2, WALL_T, rgba=pc)
         wall(f"net_{tag}_bot", sgn * (PITCH_X + GOAL_DEPTH / 2), -GOAL_HALF_W, GOAL_DEPTH / 2, WALL_T, rgba=pc)
+        # the fence follows every wall segment of this end, pocket included,
+        # so a ball lobbed over the crossbar still stays in the arena
+        fence(f"fence_{tag}_top", gx + sgn * END_WALL_EXT, GOAL_HALF_W + seg, WALL_T + END_WALL_EXT, seg)
+        fence(f"fence_{tag}_bot", gx + sgn * END_WALL_EXT, -GOAL_HALF_W - seg, WALL_T + END_WALL_EXT, seg)
+        fence(f"fence_net_{tag}_back", sgn * (PITCH_X + GOAL_DEPTH), 0, WALL_T, GOAL_HALF_W)
+        fence(f"fence_net_{tag}_top", sgn * (PITCH_X + GOAL_DEPTH / 2), GOAL_HALF_W, GOAL_DEPTH / 2, WALL_T)
+        fence(f"fence_net_{tag}_bot", sgn * (PITCH_X + GOAL_DEPTH / 2), -GOAL_HALF_W, GOAL_DEPTH / 2, WALL_T)
         # posts + visual crossbar
         for py in (GOAL_HALF_W, -GOAL_HALF_W):
             ET.SubElement(wb, "geom", {
                 "type": "cylinder", "size": f"{POST_R} {CROSSBAR_Z / 2}",
                 "pos": f"{gx} {py} {CROSSBAR_Z / 2}",
                 "rgba": "0.95 0.95 0.95 1"})
+        # a ROUND crossbar (2026-09-07): the box it was could hold a lofted
+        # ball balanced on its flat top, 2.09 m up, forever
         ET.SubElement(wb, "geom", {
-            "type": "box", "size": f"{POST_R} {GOAL_HALF_W} {POST_R}",
-            "pos": f"{gx} 0 {CROSSBAR_Z}", "rgba": "0.95 0.95 0.95 1",
+            "type": "cylinder", "size": f"{POST_R} {GOAL_HALF_W}",
+            "pos": f"{gx} 0 {CROSSBAR_Z}", "quat": "0.7071068 0.7071068 0 0",
+            "rgba": "0.95 0.95 0.95 1",
             "conaffinity": "3"})       # solid, like the posts and walls
     # 45-degree corner bevels: a ball pushed into a corner deflects back into
     # play instead of deadlocking (standard walled-pitch design)
@@ -697,9 +884,30 @@ def _pitch_xml(team_colors=TEAM_RGBA) -> str:
     line(0, 0, LW, PITCH_Y)                       # halfway line
     arc(0, 0, 1.22)                               # centre circle (9.15 m)
     line(0, 0, 0.07, 0.07)                        # centre spot
+    # TOUCHLINES, stopped at the bevel chord rather than run to the corner.
+    # Past |x| = PITCH_X - bev the boundary IS the ram panel, and the strip
+    # of floor behind it is the sealed dead triangle that the corner arcs
+    # were thrown out of (below): invisible during play, then popping into
+    # shot for a second and a half every time a ram fires. The perimeter
+    # boards already stop on the same chord (`run`, further down).
+    for sy in (-1.0, 1.0):
+        line(0, sy * PITCH_Y, PITCH_X - bev, LW)  # touchline
 
     for sgn in (-1.0, 1.0):
         gx = sgn * PITCH_X
+        # THE GOAL LINE, centred on x = +-PITCH_X because that IS the plane
+        # the goal test uses: `abs(bx) > PITCH_X` on the ball's CENTRE, so
+        # the painted midline is the tested line and at the instant a goal
+        # is given half the ball is still short of it. The other candidates
+        # nearby are NOT the rule: 6.90 is the end walls' inner face, 6.92
+        # the posts' front face (posts span 6.920-7.080 about their centre).
+        # Absent from every bundle until 2026-09-15 -- the only marking we
+        # never drew, and the only one with no wall behind it across the
+        # mouth, which is exactly where a free camera asks "was that over?".
+        # Full width on purpose: |y| > GOAL_HALF_W is inside the end wall
+        # (x in [6.90, 7.20], solid, static), the same way the halfway
+        # line's ends are buried in the side walls. Nothing can expose it.
+        line(gx, 0, LW, PITCH_Y)                  # goal line
         for depth, half_w in ((2.20, 2.67),       # penalty area
                               (0.73, 1.21)):      # goal area
             xin = gx - sgn * depth
@@ -718,7 +926,7 @@ def _pitch_xml(team_colors=TEAM_RGBA) -> str:
             start=mid - half, sweep=2 * half)
 
     # NO CORNER ARCS. They mark where a corner kick is taken, and there is
-    # no corner kick here — nor, after the 1.1 m bevel, any corner to take
+    # no corner kick here — nor, after the 1.7 m bevel, any corner to take
     # it from. Struck at (±PITCH_X, ±PITCH_Y) they landed 0.6 m BEHIND the
     # ram panel, in the sealed dead triangle: invisible during play, then
     # popping into shot for a second and a half every time a ram fired.
@@ -734,12 +942,20 @@ def _pitch_xml(team_colors=TEAM_RGBA) -> str:
             "pos": f"{(x0 + x1) / 2} {(y0 + y1) / 2} 0.011",
             "rgba": tint, "contype": "0", "conaffinity": "0", "group": "1"})
 
-    # the ball
+    # the ball: the G1's radius, mass and contact parameters exactly as
+    # before; the SKIN is the season-4 football (32 panels on a cube map),
+    # which is visual only — a material touches no contact or mass term
+    ET.SubElement(asset, "texture", dict(
+        {"type": "cube", "name": "tex_ball"}, **_ball_texture()))
+    ET.SubElement(asset, "material", {
+        "name": "mat_ball", "texture": "tex_ball",
+        "specular": "0.3", "shininess": "0.2"})
     ball = ET.SubElement(wb, "body", {"name": "ball", "pos": f"0 0 {BALL_R}"})
     ET.SubElement(ball, "freejoint", {"name": "ball_free"})
     ET.SubElement(ball, "geom", {
         "name": "ball_geom", "type": "sphere", "size": f"{BALL_R}",
-        "mass": f"{BALL_MASS}", "rgba": BALL_RGBA, "conaffinity": "3",
+        "mass": f"{BALL_MASS}", "material": "mat_ball", "conaffinity": "3",
+        "contype": "5",       # bit 4: the only thing the fence collides with
         # rolling friction 0.02 = turf: a 1.3 m/s trundle dies in ~1.5 m, a
         # 3 m/s strike still carries ~13 m. At the old 0.00012 the ball
         # rolled the length of the pitch unassisted — fixture 2's melee
@@ -865,7 +1081,11 @@ def _vivid(col):
 
 def build_football_model(manager_teams: tuple = (), cameras: bool = False,
                          team_colors=TEAM_RGBA, hair=None,
-                         kit_textures=None) -> mujoco.MjModel:
+                         kit_textures=None, n_robots: int = N_ROBOTS) -> mujoco.MjModel:
+    """The match model. `n_robots` < N_ROBOTS (2026-09-07) builds the same
+    pitch with fewer robots — the kick trainer trains on THIS model with one
+    robot, so the policy meets the walls, the fence, the mesh feet and the
+    contact mixing it will meet on match day, not a flat-plane stand-in."""
     from . import paths
     from .scene import EGOCAM_POS, _egocam_quat
     spec = mujoco.MjSpec.from_string(_pitch_xml(team_colors))
@@ -882,14 +1102,14 @@ def build_football_model(manager_teams: tuple = (), cameras: bool = False,
         mat.name = f"kit_mat{tm}"
         mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = tex.name
         kit_mats[tm] = mat.name
-    spots = list(KICKOFFS) + [MANAGER_SPAWNS[tm] for tm in sorted(manager_teams)]
-    mgr_team_of = {N_ROBOTS + k: tm for k, tm in enumerate(sorted(manager_teams))}
+    spots = list(KICKOFFS)[:n_robots] + [MANAGER_SPAWNS[tm] for tm in sorted(manager_teams)]
+    mgr_team_of = {n_robots + k: tm for k, tm in enumerate(sorted(manager_teams))}
     for i, (x, y, yaw) in enumerate(spots):
         child = mujoco.MjSpec.from_file(str(paths.G1_XML))
         frame = spec.worldbody.add_frame(pos=[x, y, 0.0],
                                          quat=list(quat_from_yaw(yaw)))
         frame.attach_body(child.body("pelvis"), f"r{i}_", "")
-        is_mgr = i >= N_ROBOTS
+        is_mgr = i >= n_robots
         team = mgr_team_of[i] if is_mgr else i // 2
         # ANTI-ENTANGLEMENT (the sim version of RoboCup's mandated
         # entanglement-safe arm design): arm collision geoms stop colliding
@@ -967,7 +1187,14 @@ class MatchResult:
     match_time_s: float
     teams: dict = field(default_factory=dict)  # {A/B: {name, code, players}}
     halves: int = 1
-    half_breaks: list[float] = field(default_factory=list)  # halftime whistle times
+    half_breaks: list[float] = field(default_factory=list)  # halftime buzzer (sim t)
+    # one entry per buzzer: {kind: half|full, t, play_end_t, dead_s, ended,
+    # restart_t}. `t` is the buzzer (power off), `play_end_t` is when the
+    # ball finally died. Everything between them is dead-ball time and the
+    # match clock is stopped for it, so both halves get the same playing
+    # time however long the ball takes to stop.
+    buzzers: list[dict] = field(default_factory=list)
+    play_end_s: float = 0.0   # sim t the FULL TIME dead ball came to rest
     score: list[int] = field(default_factory=lambda: [0, 0])
     winner: str = "draw"  # "A" | "B" | "draw"
     goals: list[dict] = field(default_factory=list)  # {t, team, scorer}
@@ -1120,6 +1347,13 @@ def _motion_meta(ctrls, dt, team_of, team_names, agents):
     }
 
 
+def _ram_snapshot(corners):
+    """Record the display state without importing the private bundle exporter."""
+    phases = ("idle", "extend", "hold", "retract")
+    return ([cn["charge"] for cn in corners],
+            [phases.index(cn["phase"] or "idle") for cn in corners])
+
+
 def run_match(agents, match_time_s: float = MATCH_TIME_S,
               mode: str = "paused", realtime_factor: float = 1.0,
               decision_deadline_s: float | None = None,
@@ -1136,9 +1370,24 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
               record_states: bool | None = None,  # None = RFL_EXPORT_STATES env
               kit_textures=None,   # {team: path-to-kit-png} for jersey panels
               badges=None,         # {team: path-to-badge-png} for the scorebug
-              video_path=None, log_dir=None) -> MatchResult:
+              video_path=None, log_dir=None,
+              kick_policies: dict | None = None,   # {team_idx: artifact path}: the residual
+              ) -> MatchResult:                  # kick in STRIKE windows (gauntlet.residual)
     assert len(agents) == N_ROBOTS and mode in ("paused", "realtime")
     managers = managers or {}
+    # Imported ONLY when a kick policy is actually supplied. It was at the
+    # top of run_match, so every match — including one with no policies at
+    # all — loaded the module, and in the public engine build, which does
+    # not ship it, `python -m gauntlet rfl` (the README's first command)
+    # died before kickoff. Caught on 2026-09-22 by running that command in
+    # the export, which is the only place the difference shows.
+    if kick_policies:
+        from .residual import ResidualStrike
+        residuals = [ResidualStrike(kick_policies[i // 2])
+                     if kick_policies.get(i // 2) else None
+                     for i in range(N_ROBOTS)]
+    else:
+        residuals = [None] * N_ROBOTS
     t_wall = time.time()
     n_bodies = N_ROBOTS + len(managers)
     model = build_football_model(manager_teams=tuple(managers),
@@ -1153,7 +1402,11 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
         c._d_cache = data
     dt = ctrls[0].simulation_dt
     decision_every = int(round(DECISION_PERIOD_S / dt))
-    max_steps = int(round(match_time_s / dt))
+    # match_time_s is PLAYING time: the dead-ball window after each buzzer
+    # stops the clock, so the sim runs longer than the match lasts.
+    max_steps = int(round((match_time_s + halves * BUZZER_DEAD_MAX_S
+                           + (halves - 1) * HALF_BREAK_S
+                           + FULL_TIME_HOLD_S + 1.0) / dt))
     request_period = max(DECISION_PERIOD_S, request_period_s or 0.0)
 
     ball_jnt = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "ball_free")
@@ -1267,7 +1520,8 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
     motion_rec = None
     if record_states and log_dir:
         log_dir.mkdir(parents=True, exist_ok=True)
-        state_rec = {"t": [], "xpos": [], "xquat": [], "next_t": 0.0}
+        state_rec = {"t": [], "xpos": [], "xquat": [], "next_t": 0.0,
+                     "corner_charge": [], "corner_phase": []}
         # everything the exporter needs to rebuild THIS model exactly;
         # a full scene.mjb is ~380 MB/match (embedded meshes), so it is
         # opt-in for debugging only
@@ -1311,16 +1565,18 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
         if obs_mode in ("camera", "sdk"):
             frame_dir = log_dir / "frames"
             frame_dir.mkdir(exist_ok=True)
+    # call_begin_episode passes log_dir only to a hook that takes it: a bare
+    # begin_episode(self) in club code took m12 off the runway on 2026-09-05.
     for i, agent in enumerate(agents):
         if hasattr(agent, "begin_episode"):
             if log_dir:
                 (log_dir / f"r{i}").mkdir(parents=True, exist_ok=True)
-            agent.begin_episode(log_dir=(log_dir / f"r{i}") if log_dir else None)
+            call_begin_episode(agent, (log_dir / f"r{i}") if log_dir else None)
     for tm, mgr in managers.items():
         if hasattr(mgr, "begin_episode"):
             if log_dir:
                 (log_dir / f"mgr{tm}").mkdir(parents=True, exist_ok=True)
-            mgr.begin_episode(log_dir=(log_dir / f"mgr{tm}") if log_dir else None)
+            call_begin_episode(mgr, (log_dir / f"mgr{tm}") if log_dir else None)
 
     renderer = None
     if video_path:
@@ -1472,17 +1728,23 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                    font=font, anchor="lm")
 
             # match clock state (counts down within the current half)
+            # The clock runs on PLAYING time: it stops dead at each buzzer
+            # and does not move again until the ball has and play restarts.
+            pt = play_now[0]
+            in_dead = dead[0] is not None
             if halves == 2:
                 half_len = match_time_s / 2
                 in_break = (half_banner[0] > -1e8
                             and 0 <= tt - half_banner[0] < HALF_BREAK_S)
-                in_h2 = tt >= half_len
-                remaining = max(0.0, (match_time_s if in_h2 else half_len) - tt)
-                tag = ("Half Time" if in_break else
-                       "Second Half" if in_h2 else "First Half")
+                in_h2 = pt >= half_len and not (in_dead and not full_done[0])
+                remaining = max(0.0, (match_time_s if in_h2 else half_len) - pt)
+                tag = ("Half Time" if (in_break or (in_dead and not full_done[0]))
+                       else "Second Half" if in_h2 else "First Half")
             else:
-                remaining = max(0.0, match_time_s - tt)
+                remaining = max(0.0, match_time_s - pt)
                 tag = ""
+            if full_done[0]:
+                tag, remaining = "Full Time", 0.0
             mm, ss = int(remaining) // 60, int(remaining) % 60
             clock_str = (f"{tag}  " if tag else "") + f"{mm:02d}:{ss:02d}"
 
@@ -1602,7 +1864,12 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                            f"{score[1]} {team_codes[1]}")
                 elif dt_h < HALF_BREAK_S + 2.0:
                     banner("SECOND HALF", (170, 220, 255, 255))
-            if match_time_s - tt < FULL_TIME_BANNER_LEAD_S:
+            # The buzzer has gone and the ball is still live: say so, in as
+            # many words as it takes. Most of the audience has never seen
+            # this rule and the picture alone does not explain it.
+            if dead[0] is not None:
+                banner("POWER OFF - BALL STILL LIVE", (255, 140, 120, 255))
+            if ft_banner[0] > -1e8:
                 banner(f"FULL TIME   {team_codes[0]} {score[0]} - "
                        f"{score[1]} {team_codes[1]}")
             if tt - drop_banner[0] < 2.5:
@@ -1621,7 +1888,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
             # corner ram countdown, drawn at the corner it belongs to
             for cn in corners:
                 frac = cn["charge"] / CORNER_ARM_S
-                if frac <= 0.05 and cn["phase"] is None:
+                if frac <= CORNER_LABEL_THRESHOLD and cn["phase"] is None:
                     continue
                 pt = project(np.array([cn["rest"][0], cn["rest"][1], 1.0]))
                 if pt is None:
@@ -1759,9 +2026,19 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
     held_reply = [None] * N_ROBOTS   # decided during the break, applied at
                                      # the whistle
     t = 0.0
+    stuck_high_t = 0.0        # ball at rest above the walls (on the crossbar): see the escape rule
     # halves + sound tape state
     half_banner = [-1e9]           # halftime banner start (match t)
     half_done = [False]
+    full_done = [False]            # the full-time buzzer has gone
+    dead = [None]                  # live buzzer window, or None while powered
+    dead_total = [0.0]             # sim seconds the clock has been stopped
+    stop_from = [None]             # sim t the clock stopped at, or None
+    stop_play = [0.0]              # what the clock reads while it is stopped
+    resume_at = [None]             # sim t play restarts (end of the interval)
+    play_now = [0.0]               # the match clock, for the HUD closure
+    ft_banner = [-1e9]             # FULL TIME banner start (sim t)
+    end_at = [None]                # stop the loop here, once the ball is dead
     ev_prev_v = [0.0, 0.0]         # ball velocity at the last event poll
     ev_contact: set = set()        # contact classes seen since the last poll
     next_event_t = [0.0]
@@ -1802,7 +2079,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
         body = mgr_bodies[team]
         mp = ctrls[body].base_pos(data)
         return {
-            "time_remaining_s": round(match_time_s - t, 1),
+            "time_remaining_s": round(match_time_s - (t - dead_total[0]), 1),
             "score": {"you": score[team], "them": score[1 - team]},
             "you_attack": {"goal_color": team_color_names[1 - team],
                            "x": PITCH_X if team == 0 else -PITCH_X,
@@ -1872,6 +2149,20 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                     target = None
             if name not in SKILL_NAMES:
                 status = "ignored_invalid"
+            elif name == "walk_to" and target is None:
+                # An order to walk with nowhere to walk to. Until 2026-09-22
+                # this was applied as "ok" and the body stood still —
+                # SkillRunner._follow(None) returns zeros — so a club whose
+                # code sent its waypoints under a key the rules never named
+                # read "ok" on every one of its statues (m45: 79 m covered
+                # in ten minutes against 565 m). Rejected like any other
+                # malformed reply: counted, logged with the reason, shown in
+                # the next obs, and after three in a row the robot holds
+                # (NOTICES 2026-09-22). turn_to without a target faces the
+                # ball and kick_toward without one aims at the goal; those
+                # are documented and stay.
+                status = "ignored_invalid"
+                error = error or 'walk_to needs "target": [x, y] or "ball"'
             else:
                 try:
                     lead = float(raw.get("lead_s") or 0.0)
@@ -1907,6 +2198,18 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
             result.robots[i].invalid_actions += 1
             if consecutive_invalid[i] >= 3:
                 skills[i].set_skill("hold", None, wms[i], (0, 0), (0, 0), t_now)
+            # The SDK obs carries last_skill, not last_action_result, and
+            # until 2026-09-22 last_skill was only written by an ACCEPTED
+            # reply — so a club's next observation still said "ok" about a
+            # skill it had asked for two seconds earlier and been refused.
+            # Say what was asked and that it was refused; the reason is in
+            # the decision log beside it.
+            asked = (str(raw.get("skill", "")).strip()
+                     if isinstance(raw, dict) else None)
+            last_skill[i] = {"skill": asked or None, "target": None,
+                             "status": "ignored_invalid"}
+            if error:
+                last_skill[i]["reason"] = error
         else:
             consecutive_invalid[i] = 0
         last_action_result[i] = status
@@ -2040,7 +2343,8 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
             run_perception(i, frame, t_now)
             ag, dg = attack_goal_xy(i), attack_goal_xy(1 - team_of[i])
             obs = {
-                "time_remaining_s": round(match_time_s - t_now, 1),
+                "time_remaining_s": round(
+                    match_time_s - (t_now - dead_total[0]), 1),
                 "decision_interval_s": round(interval, 2),
                 "you": {"id": f"r{i}", "number": i % 2 + 1,
                         "team": team_names[team_of[i]],
@@ -2075,7 +2379,8 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
             c = ctrls[i]
             mv = c.base_linvel(data)
             obs = {
-                "time_remaining_s": round(match_time_s - t_now, 1),
+                "time_remaining_s": round(
+                    match_time_s - (t_now - dead_total[0]), 1),
                 "decision_interval_s": round(interval, 2),
                 "you": {"id": f"r{i}",
                         "team": team_names[i // 2],
@@ -2105,34 +2410,74 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                              "dt_s": round(t_now - prev_frame_t[i], 2) if fresh else 0.0}
             return obs
         obs = _match_observation(ctrls, data, ball_qpos_adr, ball_qvel_adr,
-                                 i, t_now, score, fallen_flags,
+                                 i, t_now - dead_total[0], score, fallen_flags,
                                  last_action_result, match_time_s, interval,
                                  blocked_flag[i])
         obs["manager_says"] = team_message[i // 2]
         return obs
 
-    def kickoff_reset():
+    def kickoff_reset(all_reset: bool = False):
         """Ball + ALL players back to kickoff spots, upright — a restart is
         a restart: fallen robots are stood up (their recovery clock is moot
-        once play is being reset around them anyway)."""
+        once play is being reset around them anyway).
+
+        `all_reset` is the restart out of a BUZZER window, where the power
+        was off: every robot has folded up whether or not the fall detector
+        was watching, so every policy needs its action history and gait
+        clock cleared, and the managers — who normally just keep pacing —
+        have to be picked up off the floor of their own technical area."""
+        if all_reset:
+            # POWER CYCLE. `G1PolicyController.reset()` clears the wrapper's
+            # own state but NOT the scripted walk policy's: that net is
+            # recurrent, and measured here on 2026-09-07 a used-then-reset
+            # policy answers an IDENTICAL observation up to 3.4 away from a
+            # fresh one. Out of a buzzer window that hidden state is five
+            # seconds of lying on the floor, and a robot stood back up on it
+            # wobbles and goes straight down again — all four did, in the
+            # first cut of this rule. A power cut is precisely when a real
+            # robot reboots, so rebuild the objects here rather than reach
+            # into g1_policy.py, whose math is a line-faithful port.
+            for i in range(len(ctrls)):
+                fresh = G1PolicyController(prefix=f"r{i}_")
+                fresh.bind(model)
+                fresh._d_cache = data
+                ctrls[i] = fresh
+            if motion_rec is not None:
+                motion_rec["ctrls"] = ctrls[:N_ROBOTS]
         data.qpos[ball_qpos_adr:ball_qpos_adr + 7] = home_qpos[
             ball_qpos_adr:ball_qpos_adr + 7]
         data.qvel[ball_qvel_adr:ball_qvel_adr + 6] = 0.0
         last_touch[0] = None          # play is not engaged until someone touches it
         last_touch_team[0] = last_touch_team[1] = (None, -1e9)
         for i, c in enumerate(ctrls):
-            if i >= N_ROBOTS:         # manager keeps pacing the dugout
-                continue
             adr = model.jnt_qposadr[model.body(f"r{i}_pelvis").jntadr[0]]
             vadr = model.jnt_dofadr[model.body(f"r{i}_pelvis").jntadr[0]]
+            if i >= N_ROBOTS:         # manager keeps pacing the dugout
+                if not all_reset:
+                    continue
+                # ...but a manager whose power was cut is face down in the
+                # technical area. Stand them up WHERE THEY FELL: the dugout
+                # is theirs and a teleport back to the spawn mark reads as a
+                # glitch rather than a manager getting to their feet.
+                mx, my = float(data.qpos[adr]), float(data.qpos[adr + 1])
+                data.qpos[adr:adr + 19] = home_qpos[adr:adr + 19]
+                data.qpos[adr], data.qpos[adr + 1] = mx, my
+                data.qvel[vadr:vadr + 18] = 0.0
+                c.reset()
+                falls[i] = FallTracker()
+                fallen_flags[i] = False
+                blenders[i].set_target((0.0, 0.0, 0.0), t)
+                continue
             data.qpos[adr:adr + 19] = home_qpos[adr:adr + 19]
             data.qvel[vadr:vadr + 18] = 0.0
-            if fallen_flags[i]:
+            was_down = fallen_flags[i]
+            if was_down or all_reset:
                 c.reset()             # policy action history + gait clock
                 falls[i] = FallTracker()
                 fallen_flags[i] = False
                 recover_at[i] = None
-                result.robots[i].recoveries += 1
+                if was_down:
+                    result.robots[i].recoveries += 1
             blocked_flag[i] = False
             block_mark[i] = None
             blenders[i].set_target((0.0, 0.0, 0.0), t)
@@ -2329,8 +2674,20 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                     blenders[i].set_target((cmd_vx[i], 0.0, 0.0), t)
                     rot_expired[i] = True
 
+            powered = dead[0] is None and end_at[0] is None
             stopped = t < freeze_until      # half time / after a goal
+            if not powered:
+                # THE BUZZER CUT THE POWER. Not a command of zero — no
+                # torque at all, on either side and in both dugouts. The
+                # robots fold where they stand; the ball plays on without
+                # them.
+                data.ctrl[:] = 0.0
             for i, c in enumerate(ctrls):
+                if not powered:
+                    c.set_command(0.0, 0.0, 0.0)
+                    if i < N_ROBOTS:
+                        cmd_vx[i] = 0.0
+                    continue
                 if stopped and i < N_ROBOTS:
                     c.set_command(0.0, 0.0, 0.0)
                     cmd_vx[i] = 0.0
@@ -2344,9 +2701,30 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                     xy = tuple(float(v) for v in c.base_pos(data)[:2])
                     cmd = skills[i].step(wms[i], xy, yaw_from_quat(c.base_quat(data)),
                                          attack_goal_xy(i), t)
+                    res = residuals[i]
+                    if res is not None:
+                        # THE SEAM: the skill's STRIKE tick opens a 2 s window in
+                        # which the walk is told to stop and the trained residual
+                        # rides on its joint targets (gauntlet.residual). The
+                        # skill keeps being asked, so the window's end hands the
+                        # robot back to whatever it says then.
+                        if skills[i].striking and res.can_begin(
+                                t, xy, yaw_from_quat(c.base_quat(data)),
+                                wms[i].ball_xy if wms[i].ball_valid(t) else None):
+                            res.begin(skills[i].strike_dir, t)
+                            result.events.append({"t": round(t, 2), "kind": "strike", "who": i})
+                        if res.active:
+                            cmd_vx[i] = 0.0
+                            c.set_command(0.0, 0.0, 0.0)
+                            ball_xy = (wms[i].ball_xy if wms[i].ball_valid(t)
+                                       else tuple(data.qpos[ball_qpos_adr:ball_qpos_adr + 2]))
+                            if res.control(c, data, ball_xy, t):
+                                continue
                     cmd_vx[i] = cmd[0]      # keeps the "blocked" detector live
                     c.set_command(*cmd)
                 else:
+                    if residuals[i] is not None and residuals[i].active:
+                        residuals[i].abort(t)   # fallen, or the skill dropped to hold
                     c.set_command(*blenders[i].value(t))
                 c.apply_control(model, data)
             # (state, action) BEFORE the step that consumes them, on the
@@ -2373,6 +2751,32 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
             for c in ctrls:
                 c.advance(data)
             t += dt
+            # THE ESCAPE RULE: a ball outside the fenced arena (or under the
+            # floor) comes straight back to the nearest point inside, at rest,
+            # and the tape records it. The fence should make this unreachable;
+            # the rule is the guarantee.
+            bx, by, bz = data.qpos[ball_qpos_adr:ball_qpos_adr + 3]
+            # a ball balanced on the crossbar (measured: it can sit there at
+            # 2.05 m, round bar or not) counts as gone after a second at rest
+            if bz > WALL_H + BALL_R + 0.3 and np.linalg.norm(data.qvel[ball_qvel_adr:ball_qvel_adr + 3]) < 0.05:
+                stuck_high_t += dt
+            else:
+                stuck_high_t = 0.0
+            if (abs(bx) > PITCH_X + GOAL_DEPTH + 2 * WALL_T + BALL_R
+                    or abs(by) > PITCH_Y + 2 * WALL_T + BALL_R or bz < -BALL_R
+                    or stuck_high_t > 1.0):
+                stuck_high_t = 0.0
+                nx = float(np.clip(bx, -PITCH_X + 1.0, PITCH_X - 1.0))
+                ny = float(np.clip(by, -PITCH_Y + 1.0, PITCH_Y - 1.0))
+                data.qpos[ball_qpos_adr:ball_qpos_adr + 3] = (nx, ny, BALL_R)
+                data.qpos[ball_qpos_adr + 3:ball_qpos_adr + 7] = (1.0, 0.0, 0.0, 0.0)
+                data.qvel[ball_qvel_adr:ball_qvel_adr + 6] = 0.0
+                mujoco.mj_forward(model, data)
+                result.events.append({"t": round(t, 2), "kind": "ball_escape",
+                                      "from": [round(float(bx), 2), round(float(by), 2), round(float(bz), 2)],
+                                      "to": [round(nx, 2), round(ny, 2)]})
+                print(f"  [escape] {t:5.1f}s ball left the arena at ({bx:.1f}, {by:.1f}, {bz:.1f}); "
+                      f"back in play at ({nx:.1f}, {ny:.1f})")
 
             if mode == "realtime":
                 # This sleep only engages when the loop is running FASTER
@@ -2401,7 +2805,11 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                     time.sleep(ahead)
 
             for i, c in enumerate(ctrls):
-                if not fallen_flags[i]:
+                # A COLLAPSE IS NOT A FALL. With the power off every robot on
+                # the pitch goes down, and booking those as falls would put
+                # two per club per match into the stats and hand the last
+                # robot to touch anyone a tackle it never made.
+                if powered and not fallen_flags[i]:
                     falls[i].update(t, c.base_pos(data)[2],
                                     tilt_from_quat(c.base_quat(data)))
                     if falls[i].fallen:
@@ -2441,7 +2849,8 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
             # SELF-RECOVERY: after the get-up interval, stand the robot back
             # up where it fell (see FALL_RECOVERY_S)
             for i in range(N_ROBOTS):
-                if not fallen_flags[i] or recover_at[i] is None or t < recover_at[i]:
+                if (not powered or not fallen_flags[i]
+                        or recover_at[i] is None or t < recover_at[i]):
                     continue
                 jadr = model.jnt_qposadr[model.body(f"r{i}_pelvis").jntadr[0]]
                 vadr = model.jnt_dofadr[model.body(f"r{i}_pelvis").jntadr[0]]
@@ -2467,7 +2876,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
 
             # touchline governor: each manager's body stays in its dugout
             for tm, body in mgr_bodies.items():
-                if fallen_flags[body]:
+                if not powered or fallen_flags[body]:
                     continue
                 p = ctrls[body].base_pos(data)
                 x0, x1, y0, y1 = TECH_AREAS[tm]
@@ -2572,6 +2981,11 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                 state_rec["t"].append(t)
                 state_rec["xpos"].append(data.xpos.astype(np.float32))
                 state_rec["xquat"].append(data.xquat.astype(np.float32))
+                # Charge is not recoverable from a firing impulse or a pose:
+                # it can decay/cancel. Record it with the same clock/poses.
+                charge, phase = _ram_snapshot(corners)
+                state_rec["corner_charge"].append(charge)
+                state_rec["corner_phase"].append(phase)
                 state_rec["next_t"] += 1.0 / STATE_RECORD_HZ
 
             if telemetry_f is not None and t >= next_telemetry_t - 1e-9:
@@ -2586,6 +3000,15 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
 
             # CORNER RAMS: charge while the ball leans on a panel, then fire
             for cn in corners:
+                if not powered and cn["phase"] in ("extend", "hold"):
+                    # THE BUZZER DISARMS THE ARENA TOO. A panel caught
+                    # mid-stroke comes home rather than shoving a live ball
+                    # after the buzzer: from the buzzer on, the only thing
+                    # allowed to touch the ball is physics. Rewinding
+                    # phase_t by the stroke already travelled keeps the
+                    # retraction continuous instead of snapping out first.
+                    cn["phase"] = "retract"
+                    cn["phase_t"] = t - (1.0 - cn.get("f", 1.0)) * CORNER_RETRACT_S
                 if cn["phase"] is None:
                     bxx = float(data.qpos[ball_qpos_adr])
                     byy = float(data.qpos[ball_qpos_adr + 1])
@@ -2596,7 +3019,9 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                                and abs(bxx) > PITCH_X - CORNER_ZONE_X
                                and abs(byy) > PITCH_Y - CORNER_ZONE_Y
                                and bsp < CORNER_SLOW_MPS)
-                    if in_zone or t - cn["last_touch_t"] < 0.4:
+                    if not powered:
+                        cn["charge"] = 0.0       # disarmed: it cannot fire
+                    elif in_zone or t - cn["last_touch_t"] < 0.4:
                         cn["charge"] = min(CORNER_ARM_S, cn["charge"] + dt)
                     else:
                         cn["charge"] = max(0.0, cn["charge"] - dt * 0.7)
@@ -2623,6 +3048,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                             cn["phase_t"] = t
                     else:
                         f = 0.0
+                    cn["f"] = f      # stroke travelled, for a forced retract
                     data.mocap_pos[cn["mid"]] = cn["rest"] + cn["inward"] * (
                         CORNER_STROKE_M * f)
                 # arming light on the panel itself (an indicator strip in real
@@ -2630,7 +3056,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                 frac = cn["charge"] / CORNER_ARM_S
                 if cn["phase"] is not None:
                     model.geom_rgba[cn["vgid"]] = (0.95, 0.15, 0.1, 1.0)
-                elif frac > 0.05:
+                elif frac > CORNER_LABEL_THRESHOLD:
                     model.geom_rgba[cn["vgid"]] = (0.75 + 0.2 * frac,
                                                    0.75 - 0.45 * frac,
                                                    0.78 - 0.6 * frac, 1.0)
@@ -2705,18 +3131,85 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                 ev_contact.clear()
                 next_event_t[0] += EVENT_POLL_S
 
-            # HALFTIME: at the midpoint everything resets to kickoff and play
-            # pauses for HALF_BREAK_S (second half is a fresh kickoff; ends
-            # are not swapped — the pocket colors are the teams' identities)
-            if halves == 2 and not half_done[0] and t >= match_time_s / 2:
-                half_done[0] = True
-                result.half_breaks.append(round(t, 1))
-                kickoff_reset()
-                freeze_until = t + HALF_BREAK_S
-                half_banner[0] = t
-                chance[0] = None
-                print(f"  [half] {t:5.1f}s HALF TIME "
-                      f"{team_codes[0]} {score[0]} - {score[1]} {team_codes[1]}")
+            # ---------------------------------------------- THE BUZZER
+            # At the midpoint and at the end, the buzzer sounds and the
+            # power goes off. The clock stops with it — a dead ball is not
+            # playing time — so both halves get match_time_s / 2 on the
+            # pitch however long the ball takes to die. Half time then
+            # resets to kickoff spots as it always did (ends are not
+            # swapped: the pocket colours are the teams' identities).
+            # The clock is stopped from the buzzer until play actually
+            # restarts — through the dead ball AND through the interval that
+            # follows it. Before this the 12 s interval came out of the
+            # second half, which therefore ran 288 s against the first half's
+            # 300; the scoreboard counted down through the break to prove it.
+            if (stop_from[0] is not None and dead[0] is None
+                    and t >= resume_at[0]):
+                dead_total[0] += t - stop_from[0]
+                stop_from[0] = resume_at[0] = None
+            play_now[0] = (stop_play[0] if stop_from[0] is not None
+                           else t - dead_total[0])
+
+            if dead[0] is None and stop_from[0] is None:
+                kind = None
+                if not full_done[0]:
+                    if (halves == 2 and not half_done[0]
+                            and play_now[0] >= match_time_s / 2):
+                        half_done[0], kind = True, "half"
+                        result.half_breaks.append(round(t, 1))
+                    elif play_now[0] >= match_time_s:
+                        full_done[0], kind = True, "full"
+                if kind is not None:
+                    stop_from[0], stop_play[0] = t, play_now[0]
+                    dead[0] = {"kind": kind, "t0": t, "play_t0": play_now[0],
+                               "end_now": False}
+                    data.ctrl[:] = 0.0
+                    for r in residuals:
+                        # a trained strike in flight ends with the power: the
+                        # window cannot ride joint targets nothing is driving
+                        if r is not None and r.active:
+                            r.abort(t)
+                    chance[0] = None
+                    result.events.append({"t": round(t, 2), "kind": "buzzer",
+                                          "half": kind})
+                    print(f"  [buzzer] {t:5.1f}s "
+                          f"{'HALF' if kind == 'half' else 'FULL'} TIME BUZZER "
+                          f"— power off, ball still live "
+                          f"({team_codes[0]} {score[0]} - {score[1]} "
+                          f"{team_codes[1]})")
+            elif dead[0] is not None:
+                w = dead[0]
+                el = t - w["t0"]
+                bsp = float(np.hypot(data.qvel[ball_qvel_adr],
+                                     data.qvel[ball_qvel_adr + 1]))
+                why = ("goal" if w["end_now"]
+                       else "ball at rest" if (el >= BUZZER_DEAD_MIN_S
+                                               and bsp < BALL_REST_MPS)
+                       else "time" if el >= BUZZER_DEAD_MAX_S else None)
+                if why is not None:
+                    dead[0] = None
+                    entry = {"kind": w["kind"], "t": round(w["t0"], 2),
+                             "play_end_t": round(t, 2), "dead_s": round(el, 2),
+                             "ended": why, "restart_t": None}
+                    if w["kind"] == "half":
+                        kickoff_reset(all_reset=True)
+                        freeze_until = t + HALF_BREAK_S
+                        resume_at[0] = freeze_until   # clock still stopped
+                        half_banner[0] = t
+                        entry["restart_t"] = round(t + HALF_BREAK_S, 2)
+                        print(f"  [half] {t:5.1f}s HALF TIME "
+                              f"{team_codes[0]} {score[0]} - {score[1]} "
+                              f"{team_codes[1]} (dead ball {el:.1f}s, {why})")
+                    else:
+                        dead_total[0] += t - stop_from[0]   # nothing restarts
+                        stop_from[0] = None
+                        ft_banner[0] = t
+                        end_at[0] = t + FULL_TIME_HOLD_S
+                        result.play_end_s = round(t, 2)
+                        print(f"  [full] {t:5.1f}s FULL TIME "
+                              f"{team_codes[0]} {score[0]} - {score[1]} "
+                              f"{team_codes[1]} (dead ball {el:.1f}s, {why})")
+                    result.buzzers.append(entry)
 
             # REFEREE: ball stuck against a wall / in a scrum -> dropped ball
             bpos = (float(data.qpos[ball_qpos_adr]), float(data.qpos[ball_qpos_adr + 1]))
@@ -2753,7 +3246,16 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
             # (center past the posts = ball 90%+ over the line)
             bx = float(data.qpos[ball_qpos_adr])
             by = float(data.qpos[ball_qpos_adr + 1])
-            if abs(bx) > PITCH_X and abs(by) < GOAL_HALF_W:
+            # A ball over the line is normally scored ONCE because the goal
+            # resets it to the centre spot in the same breath. After the
+            # buzzer nothing resets: the ball lies in the net pocket, still
+            # over the line, and every later physics step is another goal —
+            # a 1-0 came out of the first cut of this rule as 2-0. So the
+            # goal check closes for the rest of the dead ball once one has
+            # gone in, and stays closed once full time is settled.
+            scoring_open = (end_at[0] is None
+                            and not (dead[0] is not None and dead[0]["end_now"]))
+            if scoring_open and abs(bx) > PITCH_X and abs(by) < GOAL_HALF_W:
                 scoring_team = 0 if bx > 0 else 1  # A attacks +x
                 score[scoring_team] += 1
                 # goal credit, football-style: the scoring team's last
@@ -2764,21 +3266,38 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                 scorer_idx = (atk_j if atk_j is not None and t - atk_t <= 3.0
                               else last_touch[0])
                 chance[0] = None      # the chance came off: no near-miss cheer
+                after_buzzer = dead[0] is not None
                 result.goals.append({
                     "t": round(t, 1), "team": "A" if scoring_team == 0 else "B",
-                    "scorer": scorer_idx})
+                    "scorer": scorer_idx, "after_buzzer": after_buzzer})
                 # cut to the replay BEFORE resetting, so the buffered run-up
                 # is what spectators see; the match clock is halted meanwhile
                 spent, replay_vs = play_goal_replay(scorer_idx, t)
                 result.goals[-1]["replay_s"] = replay_vs
                 if mode == "realtime":
                     wall_start += spent      # replay time is not match time
-                kickoff_reset()
-                freeze_until = t + KICKOFF_FREEZE_S
+                if after_buzzer:
+                    # The ball was already dead in law the moment it went
+                    # in: nothing restarts, and the window closes on the
+                    # next step. Half time reset and full time stop are
+                    # handled where the window is closed.
+                    dead[0]["end_now"] = True
+                    print(f"  [buzzer] {t:5.1f}s GOAL AFTER THE BUZZER — "
+                          f"{team_codes[0]} {score[0]} - {score[1]} "
+                          f"{team_codes[1]}")
+                else:
+                    kickoff_reset()
+                    freeze_until = t + KICKOFF_FREEZE_S
 
             if renderer:
                 aim_camera(t)
                 renderer.maybe_frame(data, t)
+
+            # FULL TIME: the ball has stopped and the banner has had real
+            # frames to sit on. Everything after this is broadcast_audio's
+            # freeze-frame outro over the last one.
+            if end_at[0] is not None and t >= end_at[0]:
+                break
     finally:
         if state_rec is not None and state_rec["t"]:
             np.savez_compressed(
@@ -2786,6 +3305,10 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                 t=np.asarray(state_rec["t"], dtype=np.float32),
                 xpos=np.stack(state_rec["xpos"]),
                 xquat=np.stack(state_rec["xquat"]),
+                corner_charge=np.asarray(state_rec["corner_charge"], dtype=np.float32),
+                corner_phase=np.asarray(state_rec["corner_phase"], dtype=np.uint8),
+                corner_arm_s=np.float32(CORNER_ARM_S),
+                corner_label_threshold=np.float32(CORNER_LABEL_THRESHOLD),
                 body_names=np.array([model.body(b).name
                                      for b in range(model.nbody)]),
                 hz=np.float32(STATE_RECORD_HZ))
@@ -2815,6 +3338,10 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
         if percept_r is not None:
             percept_r.close()
 
+    if not result.play_end_s:
+        # the loop ran out of steps before the ball died (it cannot, given
+        # max_steps, but a truncated match must not report play_end_s = 0)
+        result.play_end_s = round(t, 2)
     for i in range(N_ROBOTS):
         r = result.robots[i]
         r.fell = falls[i].fallen
@@ -2974,10 +3501,44 @@ class FootballScriptedAgent:
         return self._steer(obs, hx, hy, fast=False)
 
 
+class SkillKickAgent:
+    """The simplest SKILL-layer club: every decision, kick the ball toward the
+    opponents' goal (`kick_toward`), so SkillRunner's own STRIKE window fires
+    exactly as it does for the season's clubs. The scripted agent replies with
+    raw velocities and never enters STRIKE; this one exists so the residual
+    seam and the back-to-back fixture have a deterministic, skill-driven club
+    to run (2026-09-07)."""
+
+    def __init__(self, index: int, seed: int = 0):
+        self.index = index
+        self.name = "skill"
+        self.team = index // 2
+        # Seed 0 aims dead centre (the original, reproducible club). Any other
+        # seed draws a fixed aim point across the goal mouth, so a fixture can
+        # actually SAMPLE matches: run_match itself has no seed and the rest of
+        # this agent is deterministic, so without this every "seed" replayed
+        # the same match (found 2026-09-07, after two fixtures reported n=1 as
+        # if it were four).
+        aim_y = 0.0
+        if seed:
+            import random as _random
+            aim_y = _random.Random(seed).uniform(-0.7 * GOAL_HALF_W, 0.7 * GOAL_HALF_W)
+        self.aim_y = aim_y
+        self.goal = (PITCH_X if self.team == 0 else -PITCH_X, aim_y)  # A attacks +x
+
+    def begin_episode(self, log_dir=None):
+        pass
+
+    def decide(self, obs):
+        return {"skill": "kick_toward", "target": [self.goal[0], self.goal[1]]}
+
+
 def make_football_agent(spec: str, index: int, seed: int = 0,
                         prompt: str = "football_v1"):
     if spec == "scripted":
         return FootballScriptedAgent(index, seed=seed)
+    if spec == "skill":
+        return SkillKickAgent(index, seed=seed)
     from .agents import make_agent
     ag = make_agent(spec, seed=seed, prompt=prompt)
     if prompt != "football_v1":      # behaviour layer: free-form reply keys

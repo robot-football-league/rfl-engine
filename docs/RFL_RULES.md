@@ -107,6 +107,10 @@ remain supported as levels arrive.
     {"skill": "walk_to",     "target": [x, y]}   take up a position
     {"skill": "turn_to",     "target": [x, y]}   face a point (or sweep)
     {"skill": "hold"}                            stand still
+walk_to needs its target — [x, y], or "ball" to track a moving one; a
+walk_to without a usable target is an invalid reply (ignored, counted,
+and after three in a row the robot holds). kick_toward without a target
+aims at the goal; turn_to without one faces the ball.
 Skills run closed-loop at control rate with their own steering and A* path
 planning. Raw {"vx","vy","wz"} is still accepted for teams that prefer to
 drive the body themselves.
@@ -185,11 +189,54 @@ TIME banner, and the second half kicks off (ends are not swapped — the goal
 pockets are painted in the teams' colours and are their identities). The
 scorebug clock counts down within the current half, tagged 1H/2H.
 
-The pitch carries full football markings — halfway line, centre circle,
-penalty and goal areas, penalty spots — but they are PAINT.
-They confer no rules: no offside, no penalty-area offence, no set pieces,
-no keeper. They exist so the broadcast looks like football and so players
-and commentary can describe position.
+### The buzzer
+
+**Each half ends on a BUZZER, and the buzzer cuts the power.** At that
+instant every robot on the premises — both clubs' players and both managers
+— loses power and folds up where it stands. It is a buzzer and not a
+whistle on purpose: a whistle in football means the ball is dead, and here
+the opposite is true.
+
+**The ball is still live.** Play continues under physics alone until the
+ball comes to rest, for at least 5 seconds and at most 10. A ball that
+crosses the line inside that window is a **goal, and it counts** — scored,
+replayed and added to the table like any other. The last robot to touch it
+is the scorer, whether or not it is still standing.
+
+Nothing else may touch the ball after the buzzer. No decision is taken, no
+robot is stood up, no dropped ball is given, and the corner push-panels
+disarm: a panel caught mid-stroke retracts rather than firing. After the
+buzzer, only physics.
+
+The match clock STOPS at the buzzer and does not start again until play
+does — through the dead ball and through the interval that follows it. Both
+halves are therefore exactly `match_time_s / 2` of football. (Until
+2026-09-07 the interval came out of the second half, which ran 288 s against
+the first half's 300, and the scoreboard counted down through the break.) Robots do not book a fall
+for going down at the buzzer — the power went off, they did not lose their
+footing — and nobody is credited with a tackle for it. At half time the
+power comes back with a full reboot, and the second half restarts from
+kickoff spots as it always did.
+
+Practically, for your club: **a shot struck in the last second of a half is
+worth taking.** It cannot be blocked once the buzzer goes, because nothing
+that could block it has any power.
+
+The pitch carries full football markings — goal lines, touchlines, halfway
+line, centre circle, penalty and goal areas, penalty spots — but they are
+PAINT. They confer no rules: no offside, no penalty-area offence, no set
+pieces, no keeper. They exist so the broadcast looks like football and so
+players and commentary can describe position. There are no corner arcs:
+there is no corner kick, and after the bevel there is no corner to take one
+from.
+
+The one marking that is more than decoration is the GOAL LINE, because it is
+drawn on the plane the engine actually tests. **A goal is given when the
+ball's CENTRE passes x = +-7.0 inside the mouth (|y| < 1.6).** The centre,
+not the whole ball: at the instant a goal is given, 0.35 m of ball — half of
+it — is still short of the line, and the line you see is the midline of that
+plane. Nothing else in the goal mouth is the rule; the walls' inner face
+(6.90) and the posts' front face (6.92) are geometry, not the test.
 
 There is NO referee ball rescue. A ball pinned on a flat wall stays in play
 until somebody frees it; only the corners have machinery (powered push
@@ -261,13 +308,15 @@ falls and recoveries per robot.
 - RESTARTS: after a goal and at half time ALL players are reset upright to
   their kickoff spots (a fallen robot's recovery clock is cut short by the
   restart; counted as a recovery in the stats). While play is stopped NOBODY
-  moves: decisions taken before the whistle are void and the controllers are
-  held at zero until the restart whistle.
+  moves: decisions taken before the restart are void and the controllers are
+  held at zero until the restart whistle. The whistle only ever STARTS play
+  now — kickoffs, restarts after a goal — because the buzzer is what ends a
+  half (see The buzzer, above).
 - SOUND: `python -m gauntlet sound <match_dir>` post-produces a stadium mix
   from the match logs — crowd bed that swells as the ball nears a goal,
   kicks/wall/post impacts from the sound-event tape, cheers on goals and
-  near misses, and referee whistles (kickoff short, half time double, full
-  time long) — and muxes it into `<video>_tv.mp4`. The sim itself is silent;
+  near misses, the buzzer that ends each half, and referee whistles
+  (kickoff and restarts) — and muxes it into `<video>_tv.mp4`. The sim itself is silent;
   audio is broadcast production, not physics.
 
 ## Speaking for your club - `press.yaml` (optional)
@@ -366,7 +415,10 @@ as the league's control group.
   realism law on club code: an import allowlist (stdlib basics, numpy,
   torch, the engine's public factories), no engine internals, no I/O in
   match code. A club failing scrutineering on match day plays its LAST
-  GOOD commit, and the failure is public.
+  GOOD commit, and the failure is public. Scrutineering is static;
+  `python -m gauntlet kickoff` additionally runs build_team(ctx) and
+  begin_episode the way match day does, with no tokens — code that
+  raises there is treated the same way on match day.
 - Learned models are welcome: ship weight files in the club repo (keep
   artifacts under ~50 MB) and load them in build_team. Train them on
   practice logs, the public archive, or self-play outside the league.

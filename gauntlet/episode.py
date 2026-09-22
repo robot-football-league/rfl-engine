@@ -32,7 +32,8 @@ from .envelope import load_envelope
 from .g1_policy import G1PolicyController
 from .render import EpisodeRenderer
 from .scene import build_scene_xml
-from .util import CommandBlender, FallTracker, tilt_from_quat, yaw_from_quat
+from .util import (CommandBlender, FallTracker, call_begin_episode,
+                   tilt_from_quat, yaw_from_quat)
 
 TIME_LIMIT_S = 90.0
 DECISION_PERIOD_S = 0.5  # 2 Hz cap in both modes
@@ -274,7 +275,7 @@ def run_episode(course: CourseSpec, agent, repeat: int = 0,
         decisions_f = open(log_dir / "decisions.jsonl", "w")
 
     if hasattr(agent, "begin_episode"):
-        agent.begin_episode(log_dir=log_dir)
+        call_begin_episode(agent, log_dir)     # log_dir only if the hook takes it
 
     result = EpisodeResult(
         agent=getattr(agent, "name", agent.__class__.__name__),

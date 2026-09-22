@@ -46,6 +46,10 @@ DROPPABLE_PARAMS = {
     # Prompt-prefix caching. Sent as a block-shaped `system`; an aggregator
     # that will not take that shape gets the plain string instead.
     "cache_control": ("cache_control", "cache control"),
+    # Stop sequences that cut a gaffer reply at the first sign of it writing
+    # the league's own lines. Two spellings across vendors; either drops.
+    "stop": ("stop",),
+    "stop_sequences": ("stop_sequences",),
 }
 
 
@@ -356,20 +360,57 @@ class LLMAgent:
         if prefill:
             messages.append({"role": "assistant", "content": "{"})
             kwargs["stop_sequences"] = ["}"]
-        if "temperature" not in self._dropped_params:
-            kwargs["temperature"] = 0.0
-        if not prefill and "output_config" not in self._dropped_params:
-            kwargs["output_config"] = {
-                "effort": getattr(self, "effort", None) or "low"}
+        stops = getattr(self, "stop_sequences", None)
+        if stops and not prefill and "stop_sequences" not in self._dropped_params:
+            kwargs["stop_sequences"] = list(stops)[:4]
+        want_think = (bool(getattr(self, "want_reasoning", False))
+                      and not prefill
+                      and "thinking" not in self._dropped_params)
+        if want_think:
+            # The gaffer's route since 2026-09-05 (config/gaffers.yaml).
+            # claude-fable-5 and newer REJECT thinking.type=enabled and
+            # temperature; depth is set by thinking.type=adaptive plus
+            # output_config.effort. Probed live 2026-09-05 — the endpoint's
+            # own error names this shape. No temperature (deprecated on this
+            # model, and rejected alongside thinking). Player brains never set
+            # want_reasoning, so the shot-clock else branch is unchanged, and
+            # the DROPPABLE_PARAMS retry still covers a model that rejects
+            # either param by falling back to a plain call.
+            kwargs["thinking"] = {"type": "adaptive"}
+            if "output_config" not in self._dropped_params:
+                kwargs["output_config"] = {
+                    "effort": getattr(self, "effort", None) or "high"}
+        else:
+            if "temperature" not in self._dropped_params:
+                kwargs["temperature"] = 0.0
+            if not prefill and "output_config" not in self._dropped_params:
+                kwargs["output_config"] = {
+                    "effort": getattr(self, "effort", None) or "low"}
+        self.last_reasoning = None
+        self.last_reasoning_tokens = 0
         resp = self._client.messages.create(**kwargs)
-        text = "".join(b.text for b in resp.content if b.type == "text")
+        blocks = resp.content or []
+        text = "".join(getattr(b, "text", "") or "" for b in blocks
+                       if getattr(b, "type", "") == "text")
+        thoughts = [b.thinking for b in blocks
+                    if getattr(b, "type", "") == "thinking"
+                    and getattr(b, "thinking", None)]
+        if thoughts:
+            self.last_reasoning = "\n\n".join(thoughts)
         if prefill:
             text = "{" + text + ("}" if resp.stop_reason == "stop_sequence" else "")
         u = resp.usage
-        usage = {"input_tokens": u.input_tokens,
-                 "output_tokens": u.output_tokens,
-                 "cache_read_input_tokens": getattr(u, "cache_read_input_tokens", None),
-                 "cache_creation_input_tokens": getattr(u, "cache_creation_input_tokens", None)}
+        ud = u.model_dump() if hasattr(u, "model_dump") else dict(u)
+        det = ud.get("output_tokens_details") or {}
+        self.last_reasoning_tokens = int(det.get("thinking_tokens") or 0)
+        usage = {"input_tokens": ud.get("input_tokens") or 0,
+                 "output_tokens": ud.get("output_tokens") or 0,
+                 "cache_read_input_tokens":
+                     ud.get("cache_read_input_tokens") or 0,
+                 "cache_creation_input_tokens":
+                     ud.get("cache_creation_input_tokens") or 0,
+                 # inside output_tokens already — reported, not re-billed
+                 "reasoning_tokens": self.last_reasoning_tokens}
         return text, usage
 
     def _call_openai(self, user_text: str):
@@ -391,6 +432,9 @@ class LLMAgent:
             # default effort (gpt-5.6-luna: 4.5 s default, 2.6 s at low);
             # models that reject the param drop it via the 400-retry path
             kwargs["reasoning_effort"] = getattr(self, "effort", None) or "low"
+        stops = getattr(self, "stop_sequences", None)
+        if stops and "stop" not in self._dropped_params:
+            kwargs["stop"] = list(stops)[:4]
         resp = self._client.chat.completions.create(**kwargs)
         text = resp.choices[0].message.content or ""
         usage = None
@@ -420,6 +464,9 @@ class LLMAgent:
             # cap internal reasoning spend; dropped automatically on models
             # that reject a thinking config
             cfg.thinking_config = types.ThinkingConfig(thinking_budget=256)
+        stops = getattr(self, "stop_sequences", None)
+        if stops and "stop_sequences" not in self._dropped_params:
+            cfg.stop_sequences = list(stops)[:5]
         frames = getattr(self, "_frames", None)
         if frames is None and getattr(self, "_frame", None) is not None:
             frames = [self._frame]
@@ -563,6 +610,9 @@ class LLMAgent:
             kwargs["max_tokens"] = getattr(self, "max_output", None) or 2048
         if "temperature" not in self._dropped_params:
             kwargs["temperature"] = 0.0
+        stops = getattr(self, "stop_sequences", None)
+        if stops and "stop" not in self._dropped_params:
+            kwargs["stop"] = list(stops)[:4]
         # Cleared per call: a failed call must not leave the PREVIOUS turn's
         # reasoning lying around to be attributed to this one.
         self.last_reasoning = None
@@ -667,10 +717,16 @@ class LLMAgent:
                 base_url=root, api_key=key, timeout=REQUEST_TIMEOUT_S,
                 max_retries=0)
         max_tokens = getattr(self, "max_output", None) or 4096
-        # Cache the system prefix, read-billed at ~0.1x. _call_anthropic has
-        # done this all along; this path did not, so every retry re-bought the
-        # whole ~12,850-token prefix at full price — roughly a quarter of one
-        # 2026-09-02 session's total cost went on re-buying it.
+        # The cache marker is sent, and it is correct — but AIMLAPI does NOT
+        # honour it. Measured 2026-09-05 on this exact path: two calls with an
+        # identical 3,080-token prefix, full input billed both times,
+        # cache_read=0, cache_creation=0. The note that used to sit here
+        # claimed the marker saved "roughly a quarter" of a session; it saved
+        # nothing on this route. It costs nothing to keep sending (a base URL
+        # that IS Anthropic's would honour it), and the gaffer that paid for
+        # this — AFC Fable — moved to llm:anthropic: the same day. The ledger
+        # stays honest either way: it prices cache reads only when the
+        # response reports them.
         if "cache_control" not in self._dropped_params:
             system = [{"type": "text", "text": self.system_prompt,
                        "cache_control": {"type": "ephemeral"}}]
@@ -685,6 +741,9 @@ class LLMAgent:
             budget = max(1024, min(int(getattr(self, "reasoning_budget", 2048)
                                        or 2048), max_tokens - 1024))
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+        stops = getattr(self, "stop_sequences", None)
+        if stops and "stop_sequences" not in self._dropped_params:
+            kwargs["stop_sequences"] = list(stops)[:4]
         # No temperature: Anthropic rejects one while thinking is enabled.
         self.last_reasoning = None
         self.last_reasoning_tokens = 0

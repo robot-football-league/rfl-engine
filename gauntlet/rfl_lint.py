@@ -32,6 +32,15 @@ def _module_ok(name: str, local_stems: set[str]) -> bool:
     return root in local_stems           # sibling modules in the club repo
 
 
+# NOTE: a check that the engine's calls into club code (begin_episode(log_dir),
+# decide(obs)) have compatible signatures was drafted here on 2026-09-05 after
+# Muse's night-9 wrapper stopped m12. It was DROPPED in favour of the engine
+# fix that shipped in parallel (util.call_begin_episode passes log_dir only to
+# a hook that accepts it, 12e2c45): with the engine tolerant, failing lint on a
+# bare begin_episode would wrongly bench code that now runs. The dynamic check
+# is `practice`, which runs the real match; scrutineering stays static.
+
+
 def check_team(team_dir) -> list[str]:
     """Return a list of violations; empty means the club is cleared."""
     team_dir = Path(team_dir)

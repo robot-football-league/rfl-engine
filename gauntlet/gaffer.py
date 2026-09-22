@@ -37,6 +37,29 @@ PRACTICE_CAP_S = 120.0
 READ_CAP = 24_000          # chars of a file served per read
 RESULT_CAP = 6_000         # chars of a tool result echoed into the log
 
+# grep returns LINES, not pages. A page is ~6,000 tokens and is re-sent on
+# every turn it stays in the window; a hit line is ~50. Capped so a lazy
+# pattern cannot turn a search back into a file read.
+GREP_MAX_HITS = 40
+GREP_LINE_CAP = 160        # chars of a matching line shown
+GREP_FILE_CAP = 2_000_000  # decisions.jsonl is ~1.3 MB and must be searchable
+GREP_SKIP_SUFFIX = (".npz", ".mp4", ".png", ".jpg", ".jpeg", ".bin", ".zip")
+
+# The most rounds a `done` may bank at once. A club that types 30 has
+# benched itself for the season on a typo; three is enough to skip a
+# stretch and still be back before anything it learned goes stale.
+MAX_SIT_OUT = 3
+
+# A reply is cut the moment the model starts writing the LEAGUE's lines —
+# the harness's own speaker label and footers as they appear in the prompt.
+# Everything after the JSON was already discarded (see run()); this stops
+# the club paying for it. Round 2: Fable 12,507 chars ($0.30, 14% of its
+# session), DeepSeek 10,580, Gemini 7,111. None of these strings can start a
+# line of a legitimate reply: the prose comes before the JSON, and inside
+# the JSON a newline is the two characters "\n". Four, because the
+# OpenAI-shaped `stop` takes at most four.
+GAFFER_STOP = ("\n[harness", "\n[budget]", "\n[clock]", "\n[turns]")
+
 # The transcript is re-sent on every turn, so an un-windowed session pays
 # for its own history over and over: 28 turns of a growing log is roughly
 # quadratic in tokens, and it was the single biggest reason a premium
@@ -145,6 +168,14 @@ def _extract_json(text: str, with_end: bool = False):
     return (None, 0) if with_end else None
 
 
+def _sit_out_rounds(call) -> int:
+    """How many rounds a `done` asks to bank — clamped to 0..MAX_SIT_OUT."""
+    try:
+        return max(0, min(MAX_SIT_OUT, int(call.get("sit_out") or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _git(team_dir, *args, check=True):
     return subprocess.run(["git", "-C", str(team_dir), *args],
                           capture_output=True, text=True, check=check)
@@ -177,6 +208,14 @@ class GafferSession:
         self.reasoning_tokens = 0
         self.reports = []             # issues this club filed against the league
         self.fabricated_chars = 0     # league-voice text the model invented
+        self.sit_out = 0              # rounds the gaffer chose to bank at `done`
+        # Per-call usage, written to the sidecar. Until 2026-09-05 nothing
+        # recorded what a turn actually cost in tokens, so whether the prompt
+        # cache was working had to be settled with a live probe. Now the
+        # answer is in every session's own record.
+        self.usage_log = []
+        self.code_changed = False     # a write/replace touched match code
+        self.done_refusals = set()    # gates `done` has already held once
         # Set HERE, not by the caller afterwards: _system_prompt runs during
         # __init__ and has to name the current season, and season numbers are
         # not chronological -- the preseason is s0 and it comes AFTER s2.
@@ -196,6 +235,7 @@ class GafferSession:
         # LLMAgent._call_aiml). A player brain never sets this: thinking
         # costs seconds it does not have inside the decision interval.
         self.adapter.want_reasoning = True
+        self.adapter.stop_sequences = list(GAFFER_STOP)
         self.model_spec = model_spec
 
     # ------------------------------------------------------------ prompt
@@ -291,7 +331,7 @@ class GafferSession:
                 "— you pay its per-match price out of the club's match cap.\n"
                 "6. Write your first PLAYBOOK.md: how you intend to play "
                 "and iterate.\n"
-                "7. lint, practice if you wish, then done.")
+                "7. lint (it runs your kickoff too), practice, then done.")
             state = ("# Your club\n\nUnfounded. club/ contains only "
                      "scaffolding.")
         playbook = "(empty — write one)"
@@ -304,7 +344,10 @@ class GafferSession:
             notes = nt.read_text()[-3000:]
         notices = "(none)"
         if self.data and (self.data / "NOTICES.md").exists():
-            notices = (self.data / "NOTICES.md").read_text()[:4000]
+            # 6000, not 4000: four notices landed on 2026-09-05 and the
+            # fourth — the one that names the new tools — fell off the end.
+            # ~500 more tokens a turn, cached on the direct route.
+            notices = (self.data / "NOTICES.md").read_text()[:6000]
         # What the league said back about issues clubs raised. Shown to
         # EVERY club, not just the one that filed: a defect one gaffer found
         # is usually one they all have, and a visible answer is what makes
@@ -398,11 +441,82 @@ class GafferSession:
                 f"\n...[showing {offset}-{end} of {total} chars — end of file]")
         return chunk + more
 
+    def _tool_grep(self, call):
+        """Search for a pattern and return matching LINES, not files.
+
+        Built after night 9 of season 3. AFC Fable spent both of its sessions
+        paging its own 42 KB team.py a page at a time looking for one
+        function, said so — "the file is large and I can't grep it" — and
+        never found it. With no prompt cache on the current routing, every
+        page it read was re-billed for the six turns it stayed in the window,
+        so the search cost more than the change it never got to make.
+
+        Each hit carries the line's CHARACTER offset so it composes with
+        `read`, whose paging is by character, not by line.
+        """
+        pat = str(call.get("pattern") or "")
+        if not pat:
+            return "ERROR: grep needs a `pattern` (a regular expression)."
+        try:
+            rx = re.compile(pat, re.IGNORECASE)
+        except re.error as e:
+            return f"ERROR: bad pattern: {e}"
+        target = str(call.get("path") or "club").rstrip("/")
+        root = self._resolve(target)
+        if root.is_dir():
+            files = [p for p in sorted(root.rglob("*")) if p.is_file()
+                     and not any(part.startswith(".")
+                                 or part in ("__pycache__", "sessions")
+                                 for part in p.relative_to(root).parts)]
+            label_of = {p: f"{target}/{p.relative_to(root)}" for p in files}
+        else:
+            files = [root]
+            label_of = {root: target}
+        hits, scanned = [], 0
+        for p in files:
+            if p.suffix.lower() in GREP_SKIP_SUFFIX or \
+                    p.stat().st_size > GREP_FILE_CAP:
+                continue
+            try:
+                text = p.read_text(errors="replace")
+            except OSError:
+                continue
+            scanned += 1
+            off = 0
+            for n, line in enumerate(text.splitlines(keepends=True), 1):
+                if rx.search(line):
+                    hits.append(f"{label_of[p]}:{n} @{off}: "
+                                f"{line.strip()[:GREP_LINE_CAP]}")
+                    if len(hits) >= GREP_MAX_HITS:
+                        break
+                off += len(line)
+            if len(hits) >= GREP_MAX_HITS:
+                break
+        if not hits:
+            return (f"no matches for /{pat}/ in {target} "
+                    f"({scanned} file(s) searched)")
+        capped = " (capped — narrow the pattern)" if len(hits) >= GREP_MAX_HITS else ""
+        return (f"{len(hits)} match(es) for /{pat}/ in {target}{capped}. "
+                f"Format is path:line @char-offset: text — pass that offset "
+                f"(or a little less) to read to see the code around it.\n"
+                + "\n".join(hits))
+
+    def _code_nudge(self, p) -> str:
+        """Appended to any edit of match code. Lint checks imports and
+        config, not behaviour; on 2026-09-05 a wrapper that cleared lint
+        stopped m12 at kickoff, and the club had two unused practices."""
+        if p.suffix != ".py":
+            return ""
+        self.code_changed = True
+        return (" — match code changed: practice before done (lint cannot "
+                "see a crash at kickoff; practice plays the code)")
+
     def _tool_write(self, call):
         p = self._resolve(call["path"], write=True)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(call["content"])
-        return f"wrote {call['path']} ({len(call['content'])} chars)"
+        return (f"wrote {call['path']} ({len(call['content'])} chars)"
+                + self._code_nudge(p))
 
     def _tool_replace(self, call):
         p = self._resolve(call["path"], write=True)
@@ -411,12 +525,68 @@ class GafferSession:
         if n != 1:
             return f"ERROR: old occurs {n} times in {call['path']} (need exactly 1)"
         p.write_text(s.replace(call["old"], call["new"]))
-        return f"replaced in {call['path']}"
+        return f"replaced in {call['path']}" + self._code_nudge(p)
 
     def _tool_lint(self, call):
         problems = check_team(self.club)
-        return ("scrutineering CLEAR" if not problems else
-                "scrutineering FAILED:\n" + "\n".join(f"- {p}" for p in problems))
+        if problems:
+            return ("scrutineering FAILED:\n"
+                    + "\n".join(f"- {p}" for p in problems))
+        # The dynamic half, since 2026-09-22. Scrutineering is static and
+        # cleared six consecutive Muse commits that raised at kickoff; the
+        # notices then sent the club to lint to find the problem. This is
+        # exactly what _last_good does on match day, and it costs no tokens.
+        err = self._kickoff_error()
+        if err:
+            return ("scrutineering CLEAR, but KICKOFF FAILED — this code "
+                    "will not start a match, and the match-day rule would "
+                    f"play your last good commit instead:\n  {err}")
+        return ("scrutineering CLEAR; kickoff CLEAR (build_team and "
+                "begin_episode ran with the match-day ctx)")
+
+    def _kickoff_error(self):
+        """What match day would raise loading this club, or None."""
+        from .league import _kickoff_check
+        try:
+            return _kickoff_check(self.club, 0)
+        except Exception as e:                    # never let a check crash a session
+            return f"{type(e).__name__}: {e}"
+
+    def _done_gate(self):
+        """Why `done` will not be accepted THIS time, as a list of reasons —
+        each raised at most once per session, so a gaffer is told and then
+        trusted. Nothing here can trap a session: the turn cap commits
+        whatever stands, exactly as before.
+
+        Two reasons exist. The kickoff check, because on 2026-09-13 a club
+        committed six nights running against a `ctx` that is a dict, never
+        ran a practice, and its fixtures were skipped from 15 to 21
+        September while its transcripts said nothing was wrong. And the
+        practice, because lint cannot see behaviour and a 60 s practice
+        can (NOTICES 2026-09-22).
+        """
+        if not self.code_changed:
+            return []
+        seen = getattr(self, "done_refusals", None)
+        if seen is None:
+            seen = self.done_refusals = set()
+        holds = []
+        if "kickoff" not in seen:
+            err = self._kickoff_error()
+            if err:
+                seen.add("kickoff")
+                holds.append(
+                    "KICKOFF CHECK FAILED — this code will not start a "
+                    "match, and the match-day rule would play your last "
+                    f"good commit instead: {err}")
+        if (not self.practices and self.practices < MAX_PRACTICE
+                and "practice" not in seen):
+            seen.add("practice")
+            holds.append(
+                "match code changed and never practised — lint cannot see "
+                "behaviour, only practice plays the code. Call practice "
+                "(60 s is enough) before done.")
+        return holds
 
     def _tool_report(self, call):
         """Tell the league something is wrong with the league.
@@ -517,7 +687,14 @@ class GafferSession:
             if i < cut:
                 head = (text or "").strip().splitlines()
                 head = head[0] if head else ""
-                if len(head) > WINDOW_HEADLINE:
+                # A condensed file page used to show its first 220 chars of
+                # CONTENT, which told the gaffer nothing it could act on and
+                # invited a full re-read (round 2: Muse 5, DeepSeek 4). Show
+                # what was read and the cheap way back to it instead.
+                if who == "harness" and head.startswith(("[read ", "[grep ")):
+                    head = (head.split("]", 1)[0] + "] (output condensed — "
+                            "grep for what you need, or re-read a slice)")
+                elif len(head) > WINDOW_HEADLINE:
                     head = head[:WINDOW_HEADLINE] + "..."
                 lines.append(f"[{who}, earlier] {head}")
                 continue
@@ -531,7 +708,10 @@ class GafferSession:
                      f"{_fmt_dur(self.wall_cap)} left. Every club gets the "
                      f"same clock; a slow reply spends yours.")
         left = MAX_TURNS - self.turn
-        lines.append(f"[turns] {left} of {MAX_TURNS} left. When they run out "
+        # Muse hit the cap in round 2 with one unverified write on turn 27.
+        urgent = (f"ONLY {left} LEFT — write and lint what you have decided "
+                  f"NOW. " if left <= 5 else "")
+        lines.append(f"[turns] {urgent}{left} of {MAX_TURNS} left. When they run out "
                      f"the session ends wherever it stands, so make the "
                      f"changes you have decided on before you run low — an "
                      f"unwritten decision is worth nothing.")
@@ -621,6 +801,9 @@ class GafferSession:
                                   usage.get("cache_creation_input_tokens") or 0)
                 if c:
                     self.spent += c
+                self.usage_log.append({
+                    "turn": turn, "cost_usd": round(c or 0.0, 5),
+                    **{k: v for k, v in usage.items() if v}})
             # The gaffer's own working, when the model exposes it. Kept in
             # the log so ordering is automatic and _finish writes it to the
             # public transcript — but _render_transcript SKIPS this speaker,
@@ -666,7 +849,21 @@ class GafferSession:
                 continue
             strikes = 0
             if call["tool"] == "done":
+                holds = self._done_gate()
+                if holds:
+                    self.log.append(("harness", scrub_paths(
+                        "not done yet:\n"
+                        + "\n".join(f"- {h}" for h in holds)
+                        + "\nFix it, or call done again to commit as it "
+                          "stands.")))
+                    continue
                 summary = str(call.get("summary", summary))[:400]
+                self.sit_out = _sit_out_rounds(call)
+                if self.sit_out:
+                    self.log.append((
+                        "harness",
+                        f"noted: you will sit out the next {self.sit_out} "
+                        f"round(s) at no cost. Your committed code plays on."))
                 break
             handler = getattr(self, f"_tool_{call['tool']}", None)
             if handler is None:
@@ -689,11 +886,35 @@ class GafferSession:
                 what += f" {call['path']}"
                 if call.get("offset"):
                     what += f"@{call['offset']}"
+            if call.get("pattern"):
+                what += f" /{call['pattern']}/"
             self.log.append(("harness", scrub_paths(
                 f"[{what}] {result}\n({time.time()-t0:.1f}s)")))
         return self._finish(summary)
 
+    def _practice_note(self):
+        """The line the public transcript carries when match code changed
+        and was never run. Accountability, not punishment: the club's
+        readers see it, and so does the club next session."""
+        if self.code_changed and not self.practices:
+            return ("committed a change to match code without a practice "
+                    "run — lint checks imports and config, not behaviour; "
+                    "only practice plays the code")
+        return None
+
     def _finish(self, summary):
+        note = self._practice_note()
+        if note:
+            self.log.append(("harness", note))
+        # The verdict on what is about to be committed, in the public
+        # transcript and the sidecar: a club whose code will not start a
+        # match should not have to wait for a skipped fixture to hear it.
+        kickoff = self._kickoff_error() if self.code_changed else None
+        if kickoff:
+            self.log.append(("harness", scrub_paths(
+                "kickoff check on the committed code FAILED — the "
+                "match-day rule will play this club's last good commit: "
+                + kickoff)))
         sess = self.club / "sessions"
         sess.mkdir(exist_ok=True)
         tr = [f"# night {self.night} — {self.model_spec}",
@@ -743,6 +964,10 @@ class GafferSession:
                   "reports": len(self.reports),
                   "wall_s": round(time.time() - self.started_at, 1),
                   "timed_out": self.timed_out,
+                  "sit_out_rounds": self.sit_out,
+                  "code_changed": self.code_changed,
+                  "kickoff": kickoff,          # None = clear / not checked
+                  "done_refusals": sorted(getattr(self, "done_refusals", ())),
                   "commit": committed, "summary": summary}
         # The sidecar the publisher reads. Written HERE so that every
         # session is publishable however it was started: sessions run
@@ -769,7 +994,8 @@ class GafferSession:
                     pass
             meta = dict(report)
             meta.update({"season": season, "rendered_through": through,
-                         "founding": self.night == 0})
+                         "founding": self.night == 0,
+                         "usage": self.usage_log})
             (sess / f"night_{self.night:03d}.json").write_text(
                 json.dumps(meta, indent=1))
         except Exception as e:
@@ -798,3 +1024,5 @@ def run_night(team_dir, model_spec, night, budget_usd=5.0,
     finally:
         if ledger is not None and club:
             ledger.record(club, sess.spent, night=night)
+            if getattr(sess, "sit_out", 0):
+                ledger.sit_out(club, night, sess.sit_out)

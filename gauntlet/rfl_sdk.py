@@ -259,6 +259,11 @@ class SkillRunner:
         self.vx_max = envelope_vx[1]
         self.wz_max = max_wz
         self.skill = "hold"
+        # STRIKE flags for the residual seam (gauntlet.residual, 2026-09-07):
+        # set on the tick step() takes the STRIKE branch, with the unit
+        # ball-to-aim direction; cleared on every other tick
+        self.striking = False
+        self.strike_dir = (1.0, 0.0)
         self.target = None          # field coords
         self.track = None           # "ball" -> live target, re-solved each step
         self.lead_s = 0.0           # how far ahead of it to aim (team's choice)
@@ -400,6 +405,7 @@ class SkillRunner:
 
     # -- tracking (control rate)
     def step(self, wm, self_xy, self_yaw, attack_goal_xy, t):
+        self.striking = False
         if self.skill == "hold":
             return (0.0, 0.0, 0.0)
         if self.skill == "turn_to":
@@ -422,6 +428,8 @@ class SkillRunner:
             if d_stance < 0.55:
                 if abs(head_err) < 0.5:
                     # STRIKE: accelerate through the ball toward the aim point
+                    self.striking = True
+                    self.strike_dir = (dx / n, dy / n)
                     return (self.vx_max, 0.0,
                             self._turn(self_xy, self_yaw, (bx + dx / n, by + dy / n)))
                 # standing on the stance but not lined up: PIVOT, never freeze.
