@@ -28,6 +28,7 @@ from .envelope import load_envelope
 from .episode import (BLEND_S, DECISION_PERIOD_S, ROT_HOLD_S, _AsyncDecider,
                       validate_action)
 from .g1_policy import JOINT_ORDER, G1PolicyController
+from .pitch_furniture import BOARD_BG_BOTTOM, BOARD_BG_TOP, ram_face_rgba
 from .render import EpisodeRenderer
 from .scene import SPAWN_HEIGHT, _texture_assets, quat_from_yaw
 from .util import (CommandBlender, FallTracker, call_begin_episode,
@@ -165,11 +166,11 @@ FALL_RECOVERY_S = 8.0
 # the same and call it a dropped ball.
 # CORNER RAMS. Each 45-degree corner panel sits on a linear actuator (a
 # pneumatic or electric shaft behind the panel — buildable off the shelf).
-# While the ball rests against a panel its arming light counts down; at zero
+# While the ball rests against a panel its whole face brightens; at white
 # the shaft extends, sweeping the corner clear. Slow enough to be safe-ish,
 # firm enough to shift a ball and unbalance a robot standing in the way.
 CORNER_ARM_S = 4.5          # seconds in the corner before the ram fires
-CORNER_LABEL_THRESHOLD = 0.05  # fraction charged before showing the countdown
+CORNER_LABEL_THRESHOLD = 0.05  # legacy states.npz metadata; no visual threshold
 # Trigger is a corner PROXIMITY sensor (photoelectric beam / referee vision in
 # real hardware), not a contact switch: a bouncy ball rarely rests against a
 # panel, but a ball loitering in the corner — usually because robots are
@@ -364,8 +365,8 @@ def _board_texture(design: str, w_m: float) -> Path:
 
     # cabinet: near-black violet gradient, faint scanlines + panel seams —
     # the texture an idle LED board actually has, and cheap ViNT structure
-    top = _np.array([0.075, 0.062, 0.105])
-    bot = _np.array([0.028, 0.022, 0.045])
+    top = _np.array(BOARD_BG_TOP)
+    bot = _np.array(BOARD_BG_BOTTOM)
     g = _np.linspace(0.0, 1.0, H)[:, None, None]
     img = (top * (1 - g) + bot * g) * _np.ones((H, W, 3))
     img[::4] *= 0.93                        # scanlines
@@ -732,7 +733,7 @@ def _pitch_xml(team_colors=TEAM_RGBA) -> str:
                 "size": f"{panel_half} {WALL_T} {WALL_H / 2 - PANEL_DROP / 2}",
                 "pos": f"0 0 {-PANEL_DROP / 2}",
                 "contype": "0", "conaffinity": "0",
-                "rgba": "0.75 0.75 0.78 1"})
+                "rgba": " ".join(str(v) for v in ram_face_rgba(0.0))})
             # SHAFT: welded to the panel, so it travels with it. Drawn
             # from the panel's back face out to SHAFT_TIP, which is chosen
             # so the tip is STILL inside the housing at full extension —
@@ -780,8 +781,8 @@ def _pitch_xml(team_colors=TEAM_RGBA) -> str:
     pw = 2 * run / n_side                   # 2.12 m per touchline panel
     end_lo, end_hi = GOAL_HALF_W, PITCH_Y - bev
     ew = end_hi - end_lo                    # 1.2 m per end-wall panel
-    # The OUTWARD face of the south wall. It carries no bevels and runs the
-    # wall's whole length, so it takes wider panels than the touchline.
+    # The OUTWARD faces of both side walls have no bevels and run the
+    # whole length, so they take wider panels than the inward touchline.
     outer_half = PITCH_X + GOAL_DEPTH + 2 * WALL_T
     n_outer = 7
     ow = 2 * outer_half / n_outer           # 2.26 m per outer panel
@@ -799,7 +800,7 @@ def _pitch_xml(team_colors=TEAM_RGBA) -> str:
 
     def _board_quat(x_axis, z_axis):
         """Map board local axes -> world: x along the wall in the direction
-        the type reads, y up, z the pitch-facing normal (the 2d-texture
+        the type reads, y up, z the visible-face normal (the 2d-texture
         projection axis)."""
         x = np.asarray(x_axis, dtype=float)
         z = np.asarray(z_axis, dtype=float)
@@ -828,19 +829,17 @@ def _pitch_xml(team_colors=TEAM_RGBA) -> str:
         # design sequence is offset so no two boards meet corner-to-corner
         board(f"board_s_{i}", cx, -PITCH_Y - off, pw / 2,
               (-1, 0, 0), (0, 1, 0), designs[(i + 1) % 2], "w")
-    # THE ONE FACE THE BROADCAST ACTUALLY SEES BESIDES THE FAR TOUCHLINE.
-    # The TV camera sits south of the pitch, so the near wall shows it a
-    # blank back — the grey band across the bottom of every wide shot. Skin
-    # that outward face too. It reads from the same side as the far boards
-    # (camera at -y looking +y, so type still runs +x) and needs no bevel
-    # gap, because the bevels are inside the wall, not outside it.
-    # Robots cannot see these: the wall is opaque, so nothing a club
-    # observes through its cameras changes.
-    oy = PITCH_Y + 2 * WALL_T               # the south wall's outer face
+    # Exterior boards face a camera on EITHER gantry. Their local +z is
+    # outward, so the centre sits off INSIDE the wall: the visible surface
+    # lands exactly BOARD_PROUD beyond it, not BOARD_T + off (8 mm).
+    # Preserve the existing south names for recorded-scene consumers.
+    oy = PITCH_Y + 2 * WALL_T
     for i in range(n_outer):
         cx = -outer_half + ow * (i + 0.5)
-        board(f"board_out_{i}", cx, -oy - off, ow / 2,
+        board(f"board_out_{i}", cx, -oy + off, ow / 2,
               (1, 0, 0), (0, -1, 0), designs[i % 2], "o")
+        board(f"board_out_n_{i}", cx, oy - off, ow / 2,
+              (-1, 0, 0), (0, 1, 0), designs[(i + 1) % 2], "o")
 
     ey = (end_lo + end_hi) / 2
     for sgn, tag in ((1, "e"), (-1, "w")):
@@ -1345,6 +1344,19 @@ def _motion_meta(ctrls, dt, team_of, team_names, agents):
                     "for all four robots and unchanged all season; only its "
                     "cmd input differs between clubs"},
     }
+
+
+def _sync_corner_faces(model, corners, *, powered=True):
+    """Refresh visuals only; never reset a charge, phase or collision pose.
+
+    The buzzer darkens a disarmed idle face immediately, while a moving ram
+    stays white until it is home. A kickoff preserves the existing ram
+    mechanics, so refresh from their state rather than invent a visual reset.
+    """
+    for cn in corners:
+        model.geom_rgba[cn["vgid"]] = ram_face_rgba(
+            cn["charge"] / CORNER_ARM_S if powered else 0.0,
+            pushing=cn["phase"] is not None)
 
 
 def _ram_snapshot(corners):
@@ -1885,26 +1897,6 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                 d.text((w // 2 - 112, 54),
                        f"GOAL!  {team_names[gteam][:24]}", font=font,
                        fill=_vivid(c0 if gteam == 0 else c1))
-            # corner ram countdown, drawn at the corner it belongs to
-            for cn in corners:
-                frac = cn["charge"] / CORNER_ARM_S
-                if frac <= CORNER_LABEL_THRESHOLD and cn["phase"] is None:
-                    continue
-                pt = project(np.array([cn["rest"][0], cn["rest"][1], 1.0]))
-                if pt is None:
-                    continue
-                cxp, cyp = pt
-                if cn["phase"] is not None:
-                    label, col = "PUSH", (255, 80, 70, 255)
-                else:
-                    label = f"{max(0.0, CORNER_ARM_S - cn['charge']):.1f}"
-                    col = (255, 210, 90, 255)
-                tw = d.textlength(label, font=font) + 12
-                d.rounded_rectangle([cxp - tw / 2, cyp - 12, cxp + tw / 2, cyp + 10],
-                                    radius=5, fill=(12, 12, 18, 205),
-                                    outline=col, width=2)
-                d.text((cxp - tw / 2 + 6, cyp - 8), label, fill=col, font=font)
-
             # SPEECH BUBBLES: player shouts float above the speaker and track
             # them, so spectators always see who said what and where
             pending = []
@@ -2489,6 +2481,8 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
             opponent_msg[j] = ""      # floating over teleported players
             held_reply[j] = None      # decided against the old positions
         last_reset_t[0] = t
+        _sync_corner_faces(model, corners,
+                           powered=dead[0] is None and end_at[0] is None)
         mujoco.mj_forward(model, data)
 
     def play_goal_replay(scorer, goal_t):
@@ -3051,17 +3045,8 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                     cn["f"] = f      # stroke travelled, for a forced retract
                     data.mocap_pos[cn["mid"]] = cn["rest"] + cn["inward"] * (
                         CORNER_STROKE_M * f)
-                # arming light on the panel itself (an indicator strip in real
-                # hardware): grey when idle, amber charging, red when firing
-                frac = cn["charge"] / CORNER_ARM_S
-                if cn["phase"] is not None:
-                    model.geom_rgba[cn["vgid"]] = (0.95, 0.15, 0.1, 1.0)
-                elif frac > CORNER_LABEL_THRESHOLD:
-                    model.geom_rgba[cn["vgid"]] = (0.75 + 0.2 * frac,
-                                                   0.75 - 0.45 * frac,
-                                                   0.78 - 0.6 * frac, 1.0)
-                else:
-                    model.geom_rgba[cn["vgid"]] = (0.75, 0.75, 0.78, 1.0)
+            # Whole-face charge indicator, including the return to rest.
+            _sync_corner_faces(model, corners, powered=powered)
 
             # SOUND TAPE: ball impulses sampled at 25 Hz, classified by what
             # the ball touched since the last poll. Consumed after the match
@@ -3164,6 +3149,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                     dead[0] = {"kind": kind, "t0": t, "play_t0": play_now[0],
                                "end_now": False}
                     data.ctrl[:] = 0.0
+                    _sync_corner_faces(model, corners, powered=False)
                     for r in residuals:
                         # a trained strike in flight ends with the power: the
                         # window cannot ride joint targets nothing is driving
