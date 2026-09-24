@@ -24,6 +24,7 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
+from . import pitch_furniture as furniture
 from .envelope import load_envelope
 from .episode import (BLEND_S, DECISION_PERIOD_S, ROT_HOLD_S, _AsyncDecider,
                       validate_action)
@@ -166,9 +167,9 @@ FALL_RECOVERY_S = 8.0
 # the same and call it a dropped ball.
 # CORNER RAMS. Each 45-degree corner panel sits on a linear actuator (a
 # pneumatic or electric shaft behind the panel — buildable off the shelf).
-# While the ball rests against a panel its whole face brightens; at white
-# the shaft extends, sweeping the corner clear. Slow enough to be safe-ish,
-# firm enough to shift a ball and unbalance a robot standing in the way.
+# While the ball rests against a panel its green segmented meter fills;
+# at full charge the shaft extends, sweeping the corner clear. Slow enough
+# to be safe-ish, firm enough to shift a ball and unbalance a nearby robot.
 CORNER_ARM_S = 4.5          # seconds in the corner before the ram fires
 CORNER_LABEL_THRESHOLD = 0.05  # legacy states.npz metadata; no visual threshold
 # Trigger is a corner PROXIMITY sensor (photoelectric beam / referee vision in
@@ -565,6 +566,39 @@ def _ball_texture() -> dict:
     return {k: str(v) for k, v in files.items()}
 
 
+def _corner_meter_xml(body, corner, *, front_y, top_z):
+    """Noncolliding body-attached skins; local slab +Z is the outward normal."""
+    def slab(surface, kind, index, x, width, height, offset, rgba, material=None):
+        front = surface == "front"
+        attrs = {
+            "name": f"corner_meter_{corner}_{surface}_{kind}{index}",
+            "type": "box", "contype": "0", "conaffinity": "0",
+            "mass": "0", "group": "1",
+            "size": f"{width / 2} {height / 2} {furniture.RAM_METER_SKIN_HALF_M}",
+            "pos": (f"{x} {front_y - offset} {furniture.RAM_METER_FRONT_Z_M}"
+                    if front else f"{x} 0 {top_z + offset}"),
+            "quat": "0.7071067811865476 0.7071067811865476 0 0" if front else "1 0 0 0",
+            "rgba": " ".join(str(v) for v in rgba),
+        }
+        if material:
+            attrs["material"] = material
+        ET.SubElement(body, "geom", attrs)
+
+    for surface in ("front", "top"):
+        slab(surface, "bezel", "", 0, furniture.RAM_METER_WIDTH_M,
+             furniture.RAM_METER_HEIGHT_M, furniture.RAM_METER_BEZEL_OFFSET_M,
+             furniture.RAM_METER_BEZEL + (1,))
+        for i, (left, width) in enumerate(furniture.ram_meter_cells(1)):
+            slab(surface, "inactive_", i, left + width / 2, width,
+                 furniture.RAM_METER_CELL_HEIGHT_M, furniture.RAM_METER_CELL_OFFSET_M,
+                 furniture.RAM_METER_INACTIVE + (1,))
+            # Hidden, but full positive geometry at compile time. Runtime only
+            # shrinks along X, keeping MuJoCo's precomputed bounds conservative.
+            slab(surface, "lit_", i, left + width / 2, width,
+                 furniture.RAM_METER_CELL_HEIGHT_M, furniture.RAM_METER_LIT_OFFSET_M,
+                 furniture.RAM_METER_GREEN + (0,), "corner_meter_green")
+
+
 def _pitch_xml(team_colors=TEAM_RGBA) -> str:
     root = ET.Element("mujoco", {"model": "g1_football_pitch"})
     vis = ET.SubElement(root, "visual")
@@ -602,6 +636,11 @@ def _pitch_xml(team_colors=TEAM_RGBA) -> str:
         "name": "pitchgrass", "texture": "pitchgrass",
         "texuniform": "true", "texrepeat": "0.5 0.5", "reflectance": "0"})
     _texture_assets(asset)
+    ET.SubElement(asset, "material", {
+        "name": "corner_meter_green",
+        "rgba": " ".join(str(v) for v in furniture.RAM_METER_GREEN + (1,)),
+        "emission": str(furniture.RAM_METER_EMISSION),
+        "specular": "0", "shininess": "0", "reflectance": "0"})
 
     wb = ET.SubElement(root, "worldbody")
     ET.SubElement(wb, "light", {"pos": "0 0 12", "dir": "0 0 -1",
@@ -734,6 +773,8 @@ def _pitch_xml(team_colors=TEAM_RGBA) -> str:
                 "pos": f"0 0 {-PANEL_DROP / 2}",
                 "contype": "0", "conaffinity": "0",
                 "rgba": " ".join(str(v) for v in ram_face_rgba(0.0))})
+            _corner_meter_xml(body, k, front_y=-WALL_T,
+                              top_z=WALL_H / 2 - PANEL_DROP)
             # SHAFT: welded to the panel, so it travels with it. Drawn
             # from the panel's back face out to SHAFT_TIP, which is chosen
             # so the tip is STILL inside the housing at full extension —
@@ -1347,16 +1388,38 @@ def _motion_meta(ctrls, dt, team_of, team_names, agents):
 
 
 def _sync_corner_faces(model, corners, *, powered=True):
-    """Refresh visuals only; never reset a charge, phase or collision pose.
+    """Refresh dark housings and segmented meters; never change ram mechanics.
 
-    The buzzer darkens a disarmed idle face immediately, while a moving ram
-    stays white until it is home. A kickoff preserves the existing ram
-    mechanics, so refresh from their state rather than invent a visual reset.
+    Idle meters clear immediately on the buzzer. Moving rams stay full until
+    home, including forced retraction. Metadata is resolved lazily from the
+    actual corner face, so ordinary match corner dictionaries need no setup.
     """
     for cn in corners:
-        model.geom_rgba[cn["vgid"]] = ram_face_rgba(
+        model.geom_rgba[cn["vgid"]] = ram_face_rgba(0)
+        cache = cn.get("_meter_cache")
+        key = (id(model), cn["vgid"])
+        if cache is None or cache[0] != key:
+            face_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, cn["vgid"])
+            corner = face_name.removeprefix("corner_face_")
+            ids = tuple(tuple(model.geom(f"corner_meter_{corner}_{surface}_lit_{i}").id
+                              for surface in ("front", "top"))
+                        for i in range(furniture.RAM_METER_SEGMENTS))
+            cn["_meter_cache"] = cache = (key, ids)
+        fraction = furniture.ram_meter_fraction(
             cn["charge"] / CORNER_ARM_S if powered else 0.0,
             pushing=cn["phase"] is not None)
+        if cn.get("_meter_shown") == (key, fraction):
+            continue  # especially the three idle corners; no per-cell writes
+        cn["_meter_shown"] = (key, fraction)
+        cells = furniture.ram_meter_cells(fraction)
+        for (left, width), ids in zip(cells, cache[1]):
+            # Empty cells retain positive size, hidden by alpha. At nonzero
+            # charge only the leading cell changes width; green never fades.
+            visible_width = width if width > 0 else furniture.RAM_METER_CELL_WIDTH_M
+            for gid in ids:
+                model.geom_size[gid, 0] = visible_width / 2
+                model.geom_pos[gid, 0] = left + visible_width / 2
+                model.geom_rgba[gid] = furniture.RAM_METER_GREEN + (float(width > 0),)
 
 
 def _ram_snapshot(corners):
@@ -3045,7 +3108,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                     cn["f"] = f      # stroke travelled, for a forced retract
                     data.mocap_pos[cn["mid"]] = cn["rest"] + cn["inward"] * (
                         CORNER_STROKE_M * f)
-            # Whole-face charge indicator, including the return to rest.
+            # Segmented charge meters, including the return to rest.
             _sync_corner_faces(model, corners, powered=powered)
 
             # SOUND TAPE: ball impulses sampled at 25 Hz, classified by what
