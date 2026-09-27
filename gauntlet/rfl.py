@@ -123,7 +123,23 @@ def run_rfl_match(team_a_dir, team_b_dir, match_time_s: float = 90.0,
                   mode: str = "realtime", halves: int = 1,
                   record_states: bool | None = None,
                   honest_latency: bool | None = None,
-                  video_path=None, log_dir=None):
+                  video_path=None, log_dir=None, *,
+                  goal_explosion: bool = False, goal_release=None):
+    """Play with an explicit presentation flag; never infer it from environment.
+
+    Optional goal_release is a goal_release.GoalRelease resolved by the league
+    for this match. It must agree with the flag and is recorded as provenance.
+    Direct calls omit it; they still record the engine's actual enabled flag.
+    """
+    # Validate before imports/build_team: club startup may do paid work.
+    if type(goal_explosion) is not bool:
+        raise ValueError("goal_explosion must be a bool")
+    if goal_release is not None:
+        from .goal_release import GoalRelease
+        if not isinstance(goal_release, GoalRelease):
+            raise ValueError("goal_release must be a GoalRelease")
+        if goal_release.enabled is not goal_explosion:
+            raise ValueError("goal_explosion does not match goal_release")
     from .football import run_match
     if honest_latency is None:
         # league-wide switch lives in the environment so the render pipeline
@@ -162,7 +178,7 @@ def run_rfl_match(team_a_dir, team_b_dir, match_time_s: float = 90.0,
     result = run_match(
         agents, match_time_s=match_time_s, mode=mode, halves=halves,
         decision_deadline_s=3.0, request_period_s=2.0,
-        honest_latency=honest_latency,
+        honest_latency=honest_latency, goal_explosion=goal_explosion,
         managers=managers, obs_mode="sdk",
         team_colors=(a.color, b.color),
         team_color_names=(a.color_name, b.color_name),
@@ -178,6 +194,9 @@ def run_rfl_match(team_a_dir, team_b_dir, match_time_s: float = 90.0,
                "away": {"team": b.name, "code": b.code, "goals": result.score[1]},
                "winner": (a.name if result.winner == "A"
                           else b.name if result.winner == "B" else "draw")}
+    fixture["goal_explosion"] = result.goal_explosion
+    if goal_release is not None:
+        fixture["goal_celebration"] = goal_release.to_dict()
     # provenance: the exact club code and engine commit that played
     code = {"home": _code_stamp(a.path), "away": _code_stamp(b.path)}
     engine_sha = _git_out(Path(__file__).resolve().parent.parent,

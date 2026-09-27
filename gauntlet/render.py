@@ -16,6 +16,7 @@ class VideoWriter:
         if shutil.which("ffmpeg") is None:
             raise RuntimeError("ffmpeg not found on PATH; required for MP4 replays")
         Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.frames = 0
         self.proc = subprocess.Popen(
             [
                 "ffmpeg", "-y", "-loglevel", "error",
@@ -29,11 +30,14 @@ class VideoWriter:
 
     def add(self, frame: np.ndarray):
         self.proc.stdin.write(frame.tobytes())
+        self.frames += 1
 
     def close(self):
         if self.proc.stdin:
             self.proc.stdin.close()
-        self.proc.wait()
+        code = self.proc.wait()
+        if code:
+            raise RuntimeError(f"video encoder failed (exit {code})")
 
 
 class EpisodeRenderer:
@@ -85,5 +89,7 @@ class EpisodeRenderer:
             self._next_frame_t += self._frame_period
 
     def close(self):
-        self.writer.close()
-        self.renderer.close()
+        try:
+            self.writer.close()
+        finally:
+            self.renderer.close()

@@ -1246,6 +1246,7 @@ class MatchResult:
     est_cost_usd: float | None = None  # None when no priced model played
     wall_time_s: float = 0.0
     honest_latency: bool = False  # replies charged their wall latency in sim time
+    goal_explosion: bool = False  # actual presentation option, even for a 0-0
 
     def to_dict(self):
         return asdict(self)
@@ -1446,8 +1447,11 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
               kit_textures=None,   # {team: path-to-kit-png} for jersey panels
               badges=None,         # {team: path-to-badge-png} for the scorebug
               video_path=None, log_dir=None,
+              goal_explosion: bool = False,       # explicit; league release policy lives upstream
               kick_policies: dict | None = None,   # {team_idx: artifact path}: the residual
               ) -> MatchResult:                  # kick in STRIKE windows (gauntlet.residual)
+    if type(goal_explosion) is not bool:
+        raise ValueError("goal_explosion must be a bool")
     assert len(agents) == N_ROBOTS and mode in ("paused", "realtime")
     managers = managers or {}
     # Imported ONLY when a kick policy is actually supplied. It was at the
@@ -1520,6 +1524,16 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
         for g in robot_geoms[i]:
             geom_owner[g] = i
 
+    # Set up presentation bookkeeping before any asynchronous club calls.
+    # Only a compact state snapshot is taken at goals; expensive work is deferred.
+    pending_goals = []
+    if goal_explosion:
+        import copy
+        from . import goal_explosion as goal_fx
+        fx_model = copy.copy(model)
+        fx_controllers = goal_fx.controller_specs(ctrls)
+        fx_bodies = [model.body(f"r{j}_pelvis").id for j in range(n_bodies)]
+
     envelope = load_envelope()
     ego_r = None
     if obs_mode in ("camera", "sdk"):
@@ -1577,6 +1591,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
     falls = [FallTracker() for _ in range(n_bodies)]
     fallen_flags = [False] * n_bodies
     result = MatchResult(mode=mode, match_time_s=match_time_s, halves=halves,
+                         goal_explosion=goal_explosion,
                          honest_latency=bool(honest_latency and mode == "realtime"),
                          teams={k: {"name": team_names[tm],
                                     "code": team_codes[tm],
@@ -1758,7 +1773,24 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
             except Exception:
                 pass
 
+        def overlay_state():
+            # No rasterisation here. Freeze the goal's HUD, not the final score.
+            return {"score": score[:], "play_now": play_now[:], "dead": dead[:],
+                    "half_banner": half_banner[:], "full_done": full_done[:],
+                    "ft_banner": ft_banner[:], "drop_banner": drop_banner[:],
+                    "bubbles": bubbles[:],
+                    "fallen_flags": fallen_flags[:], "subtitles": dict(subtitles),
+                    "goals": result.goals[:]}
+
         def overlay(frame, tt):
+            # Offline celebration frames use the frozen goal-time HUD context.
+            ctx = getattr(renderer, "presentation_context", None) or overlay_state()
+            score, play_now, dead = ctx["score"], ctx["play_now"], ctx["dead"]
+            half_banner, full_done = ctx["half_banner"], ctx["full_done"]
+            ft_banner, drop_banner = ctx["ft_banner"], ctx["drop_banner"]
+            bubbles = ctx["bubbles"]
+            fallen_flags, subtitles = ctx["fallen_flags"], ctx["subtitles"]
+            shown_result_goals = ctx["goals"]
             from PIL import Image, ImageDraw
 
             from .draw2d import Scaled
@@ -1776,7 +1808,10 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
 
             # floating player name plates (broadcast-side, not in-world)
             for j in range(N_ROBOTS):
-                pt = project(ctrls[j].base_pos(data) + np.array([0, 0, 0.75]))
+                pos = (renderer.presentation_xpos[model.body(f"r{j}_pelvis").id]
+                       if getattr(renderer, "presentation_xpos", None) is not None
+                       else ctrls[j].base_pos(data))
+                pt = project(pos + np.array([0, 0, 0.75]))
                 if pt is None:
                     continue
                 cx, cy = pt
@@ -1881,7 +1916,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                    fill=(255, 255, 255, 255))
             # scorers so far on a full-width row above the bar (own goals
             # marked, minute in match minutes); clock tab stacks above it
-            shown_goals = [g for g in result.goals if g["t"] <= tt]
+            shown_goals = [g for g in shown_result_goals if g["t"] <= tt]
             srow = 0
             if shown_goals:
                 def side_list(side):
@@ -1953,8 +1988,8 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                 d.text((w // 2 - 132, 54), "REFEREE: DROPPED BALL (was stuck)",
                        fill=(255, 220, 120, 255), font=font)
             # GOAL banner for 3 s after each goal
-            if result.goals and tt - result.goals[-1]["t"] < 3.0:
-                gteam = 0 if result.goals[-1]["team"] == "A" else 1
+            if shown_result_goals and tt - shown_result_goals[-1]["t"] < 3.0:
+                gteam = 0 if shown_result_goals[-1]["team"] == "A" else 1
                 d.rounded_rectangle([w // 2 - 130, 46, w // 2 + 130, 76],
                                     radius=8, fill=(12, 12, 18, 220))
                 d.text((w // 2 - 112, 54),
@@ -1967,7 +2002,10 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                 msg, said_t = bubbles[j]
                 if not msg or tt - said_t > BUBBLE_S or fallen_flags[j]:
                     continue
-                pt = project(ctrls[j].base_pos(data) + np.array([0, 0, 1.05]))
+                pos = (renderer.presentation_xpos[model.body(f"r{j}_pelvis").id]
+                       if getattr(renderer, "presentation_xpos", None) is not None
+                       else ctrls[j].base_pos(data))
+                pt = project(pos + np.array([0, 0, 1.05]))
                 if pt is None:
                     continue
                 words, line, rows_ = msg.split(), "", []
@@ -2065,6 +2103,7 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
     drop_banner = [-1e9]
     replay_buf: list = []          # rolling qpos snapshots for goal replays
     next_replay_t = [0.0]
+    goal_captures = []            # populated only AFTER sporting play
     # one snapshot per output frame => sample at the WRITER's rate, never a
     # constant; any mismatch between the two is a playback-speed change
     replay_hz = float(getattr(renderer, "fps", REPLAY_SAMPLE_HZ)
@@ -3317,8 +3356,19 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
                 chance[0] = None      # the chance came off: no near-miss cheer
                 after_buzzer = dead[0] is not None
                 result.goals.append({
-                    "t": round(t, 1), "team": "A" if scoring_team == 0 else "B",
+                    "t": round(t, 6) if goal_explosion else round(t, 1),
+                    "team": "A" if scoring_team == 0 else "B",
                     "scorer": scorer_idx, "after_buzzer": after_buzzer})
+                if goal_explosion:
+                    # Observation-sized copy, not a simulation/render pause.
+                    # Crucially no capture(), encoder or camera work here:
+                    # async club watchdogs retain the legacy replay schedule.
+                    pending_goals.append({
+                        "saved": goal_fx.snapshot(model, data),
+                        "goal": result.goals[-1],
+                        "seed": len(result.goals), "powered": not after_buzzer,
+                        "frame": renderer.writer.frames if renderer else None,
+                        "overlay": copy.deepcopy(overlay_state()) if renderer else None})
                 # cut to the replay BEFORE resetting, so the buffered run-up
                 # is what spectators see; the match clock is halted meanwhile
                 spent, replay_vs = play_goal_replay(scorer_idx, t)
@@ -3448,6 +3498,51 @@ def run_match(agents, match_time_s: float = MATCH_TIME_S,
     if result.est_cost_usd is not None:
         print(f"  [cost] match est. ${result.est_cost_usd:.3f} "
               f"({result.tokens_in} in / {result.tokens_out} out tokens)")
+    # Freeze sporting metrics and costs before any presentation processing.
+    # No club polling/submission, model mutation or replay-camera work occurs
+    # in the loop on behalf of celebrations. The original MP4 already contains
+    # legacy replays; exact writer frame offsets place inserts before each one.
+    if pending_goals:
+        import tempfile
+        from .goal_explosion import DURATION_S, effect_geometry
+        from .goal_explosion_render import render_celebration
+        from .goal_video import assemble
+        with tempfile.TemporaryDirectory(prefix="goal-inserts-",
+                dir=Path(video_path).parent if video_path else None) as td:
+            inserts = []
+            for k, pending in enumerate(pending_goals):
+                saved_data = goal_fx.restore(fx_model, pending["saved"])
+                clip = goal_fx.capture(fx_model, saved_data, fx_bodies,
+                    controllers=fx_controllers, powered=pending["powered"],
+                    seed=pending["seed"], hz=TV_FPS if video_path else STATE_RECORD_HZ)
+                goal = pending["goal"]
+                goal.update(celebration_s=DURATION_S,
+                    explosion={"origin": [float(v) for v in clip["origin"]],
+                               "impacts": clip["impacts"], "seed": pending["seed"]})
+                if state_rec is not None:
+                    ages = np.arange(round(DURATION_S * STATE_RECORD_HZ) + 1) / STATE_RECORD_HZ
+                    ix = np.abs(clip["age"][:, None] - ages).argmin(axis=0)
+                    goal_captures.append({"t": goal["t"], "age": ages,
+                        "xpos": clip["xpos"][ix], "xquat": clip["xquat"][ix]})
+                if video_path:
+                    path = Path(td) / f"{k}.mp4"
+                    renderer = EpisodeRenderer(fx_model, path, track_body=None,
+                        width=TV_W, height=TV_H, fps=TV_FPS, crf=TV_CRF)
+                    renderer.overlay_fn = overlay
+                    renderer.presentation_context = pending["overlay"]
+                    try:
+                        render_celebration(renderer, fx_model, saved_data, clip, goal["t"])
+                    finally:
+                        renderer.close()
+                    inserts.append((pending["frame"], path))
+            if video_path:
+                assemble(Path(video_path), inserts, TV_FPS)
+        if goal_captures:
+            np.savez_compressed(log_dir / "goal_celebrations.npz",
+                t=np.array([c["t"] for c in goal_captures]), age=goal_captures[0]["age"],
+                xpos=np.stack([c["xpos"] for c in goal_captures]),
+                xquat=np.stack([c["xquat"] for c in goal_captures]),
+                effect_names=np.array([e["name"] for e in effect_geometry()]))
     result.wall_time_s = round(time.time() - t_wall, 1)
     if log_dir:
         (log_dir / "match.json").write_text(json.dumps(result.to_dict(), indent=2))

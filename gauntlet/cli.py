@@ -67,6 +67,8 @@ def main(argv=None):
     fb.add_argument("--manager-a", default=None, help="agent spec for team A's manager")
     fb.add_argument("--manager-b", default=None, help="agent spec for team B's manager")
     fb.add_argument("--obs", choices=["full", "camera"], default="full")
+    fb.add_argument("--goal-explosion", action="store_true",
+                    help="preview detached goal celebration (not enabled in league)")
 
     rs = sub.add_parser("rfl-serve", help="RFL 0.2: networked game server")
     rs.add_argument("--port", type=int, default=8800)
@@ -198,7 +200,8 @@ def main(argv=None):
                         managers=managers, obs_mode=args.obs,
                         decision_deadline_s=3.0 if args.obs == "camera" else None,
                         request_period_s=2.0 if args.obs == "camera" else None,
-                        video_path=args.video, log_dir=args.out)
+                        video_path=args.video, log_dir=args.out,
+                        goal_explosion=args.goal_explosion)
         print(_json.dumps(res.to_dict(), indent=2))
 
     if args.cmd == "rfl":

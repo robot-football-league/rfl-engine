@@ -22,6 +22,8 @@ from pathlib import Path
 
 import yaml
 
+from .goal_release import resolve_goal_celebration, validate_goal_celebration
+
 
 def _utc_now() -> str:
     from datetime import datetime, timezone
@@ -30,6 +32,7 @@ def _utc_now() -> str:
 
 def _load(league_path):
     cfg = yaml.safe_load(Path(league_path).read_text())
+    validate_goal_celebration(cfg, season=cfg.get("season", 1))
     root = Path("runs/league") / f"s{cfg.get('season', 1)}"
     root.mkdir(parents=True, exist_ok=True)
     state_p = root / "table.json"
@@ -172,6 +175,29 @@ def _last_good(side: str, team_index: int, root: Path, teams_dir=Path("teams")):
     return str(live), record
 
 
+def rearranged(cfg) -> dict:
+    """{fixture: the skipped fixture it rearranges}, from league.yaml.
+
+    A skipped fixture keeps its number and its `skipped` record: the queue
+    airs in fixture order, so reinstating m34 in place would have taken the
+    NEXT slot and pushed every queued match back (NOTICES 2026-09-25). The
+    rearrangement is appended after the last round instead, and belongs to
+    the ROUND of the fixture it replaces."""
+    return {int(k): int(v) for k, v in (cfg.get("rearranged") or {}).items()}
+
+
+def total_rounds(cfg) -> int:
+    """Rounds in the season. Rearranged fixtures add matches, not rounds."""
+    per_round = max(1, len(cfg["teams"]) // 2)
+    return -(-(len(cfg["fixtures"]) - len(rearranged(cfg))) // per_round)
+
+
+def round_of(cfg, n: int) -> int:
+    """The round fixture n belongs to — a rearranged one, its original's."""
+    per_round = max(1, len(cfg["teams"]) // 2)
+    return -(-rearranged(cfg).get(n, n) // per_round)
+
+
 def double_round_robin(teams):
     """Home/away reversed in the second half — same shape as _rollover.
 
@@ -205,11 +231,15 @@ def _rollover(league_path, cfg, root):
     round robin (home/away reversed in the second half of the fixtures)."""
     import shutil
     season = cfg.get("season", 1)
-    shutil.copy(league_path, root / "league.yaml")   # archive as played
     teams = cfg["teams"]
     cfg2 = dict(cfg)
+    cfg2.pop("rearranged", None)     # names THIS season's fixture numbers
     cfg2["season"] = season + 1
     cfg2["fixtures"] = double_round_robin(teams)
+    # An enabled season pin must never silently carry into a new season.
+    # Refuse before archiving/changing config, not after a partial rollover.
+    validate_goal_celebration(cfg2, season=cfg2["season"])
+    shutil.copy(league_path, root / "league.yaml")   # archive as played
     Path(league_path).write_text(yaml.safe_dump(cfg2, sort_keys=False))
     print(f"  [league] season {season} archived -> season {season + 1} "
           f"begins: {len(cfg2['fixtures'])} matches (double round robin)")
@@ -283,9 +313,15 @@ def play_next(league_path="league.yaml", audio=True):
     # or read a table. render_next descendants reuse a VERIFIED inherited FD.
     from .render_lock import render_lock
     from .render_capacity import require_render_capacity
+    # Station-only dependency: league itself also ships in the public subset.
+    from .goal_delivery import preflight
     with render_lock():
         # Before _load, fallback exports or output creation, including direct use.
         require_render_capacity()
+        # A completed enabled recording must reach the box before another
+        # match (or a skip/rollover) can mutate state. Recorded evidence, not
+        # today's policy switch, controls this read-only admission check.
+        preflight(league_path)
         return _play_next_locked(league_path, audio)
 
 
@@ -359,6 +395,10 @@ def _play_next_locked(league_path, audio):
             break
         _skip_fixture(state, state_p, k, home, away, why)
         k = _next_index(state, fixtures)
+    # k may have advanced past failed scrutineering/kickoff candidates.
+    # Resolve that actual match number, never len(played) or the first candidate.
+    goal_release = resolve_goal_celebration(
+        cfg, season=cfg.get("season", 1), match_index=k + 1)
     # Exclusive creation is the final guard even against non-cooperating
     # writers. Leave partial output intact on failure; never retry in place.
     out.mkdir(exist_ok=False)
@@ -371,6 +411,7 @@ def _play_next_locked(league_path, audio):
         match_time_s=float(cfg.get("match_time_s", 600)),
         halves=int(cfg.get("halves", 2)),
         record_states=True,   # every fixture becomes volumetric-exportable
+        goal_explosion=goal_release.enabled, goal_release=goal_release,
         video_path=str(out / "match.mp4"), log_dir=str(out))
     def roster(td):
         cfg_t = yaml.safe_load((Path("teams") / td / "team.yaml").read_text())
@@ -379,6 +420,8 @@ def _play_next_locked(league_path, audio):
     entry = {"fixture": k + 1, "home": home, "away": away,
              "score": list(res.score),
              "goals": res.goals, "est_cost_usd": res.est_cost_usd,
+             "goal_explosion": res.goal_explosion,
+             "goal_celebration": goal_release.to_dict(),
              "players": {"home": roster(home), "away": roster(away)},
              "dir": str(out)}
     state["played"].append(entry)
@@ -461,11 +504,20 @@ def _play_next_locked(league_path, audio):
         export_match(out, fixture=k + 1)
     except Exception as e:      # a bundle-less match still counts
         print(f"  [volumetric] export skipped: {e}")
-    try:                        # ...then queue it on 4dgsx.com (next free
-        from .publish import publish_bundle       # broadcast slot)
-        publish_bundle(out, season=int(cfg.get("season", 1)), fixture=k + 1)
-    except Exception as e:      # an unpublished match still counts
-        print(f"  [4dgsx] publish skipped: {e}")
+    # Enabled results must pass delivery.prepare's decisions/latency/source
+    # checks and immutable intent BEFORE any publication, including later
+    # matches whose first-release review already passed. The outer station
+    # pipeline owns that ordering; direct CLI runs also leave these results
+    # local for explicit same-result delivery. Legacy/off publishing is unchanged.
+    if goal_release.enabled:
+        print("  [4dgsx] goal celebration held for validated same-result delivery; "
+              "do not rerender")
+    else:
+        try:                    # ...then queue it on 4dgsx.com (next free slot)
+            from .publish import publish_bundle
+            publish_bundle(out, season=int(cfg.get("season", 1)), fixture=k + 1)
+        except Exception as e:  # an unpublished match still counts
+            print(f"  [4dgsx] publish skipped: {e}")
     print_table(league_path)
     return entry
 
